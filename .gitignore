@@ -1,0 +1,20 @@
+# Secrets and local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*.json
+
+# Local search data may contain personal travel history and raw provider responses.
+data/
+exports/
+
+# Python/editor noise
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+.pytest_cache/
