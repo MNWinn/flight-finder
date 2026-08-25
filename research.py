@@ -32,6 +32,37 @@ CABIN_ALIASES = {
 }
 DEFAULT_CABIN = "business"
 DEFAULT_PASSENGERS = 1
+# Portable aliases make common free-text constraints survive a sparse/manual import
+# catalog. They are canonical redemption-program IDs, not required providers or
+# transfer sources; arbitrary programs remain available through structured briefs.
+GENERIC_PROGRAM_ALIASES: dict[str, tuple[str, ...]] = {
+    "aeromexico": ("aeromexico", "club premier", "aeromexico rewards"),
+    "aeroplan": ("aeroplan", "air canada", "air canada aeroplan"),
+    "alaska": ("alaska", "alaska mileage plan", "alaska atmos"),
+    "american": ("american", "aadvantage", "american airlines"),
+    "azul": ("azul", "tudoazul"),
+    "connectmiles": ("connectmiles", "copa connectmiles"),
+    "delta": ("delta", "skymiles", "delta skymiles"),
+    "emirates": ("emirates", "skywards", "emirates skywards"),
+    "ethiopian": ("ethiopian", "shebamiles"),
+    "etihad": ("etihad", "etihad guest"),
+    "eurobonus": ("eurobonus", "sas eurobonus"),
+    "finnair": ("finnair", "finnair plus"),
+    "flyingblue": ("flying blue", "flyingblue", "air france klm flying blue"),
+    "frontier": ("frontier", "frontier miles"),
+    "jetblue": ("jetblue", "jet blue", "trueblue"),
+    "lufthansa": ("lufthansa", "miles and more", "miles & more"),
+    "qantas": ("qantas", "qantas frequent flyer"),
+    "qatar": ("qatar", "qatar privilege club"),
+    "saudia": ("saudia", "alfursan"),
+    "singapore": ("singapore", "krisflyer", "singapore krisflyer"),
+    "smiles": ("gol smiles", "smiles"),
+    "spirit": ("spirit", "spirit airlines"),
+    "turkish": ("turkish", "miles and smiles", "miles & smiles"),
+    "united": ("united", "mileageplus", "united mileageplus"),
+    "velocity": ("velocity", "virgin australia velocity"),
+    "virginatlantic": ("virgin atlantic", "virgin flying club"),
+}
 MAX_AIRPORTS_PER_SIDE = 3
 MAX_FETCH_DATE_SPAN_DAYS = 14
 MAX_FETCH_RESULTS = 100
@@ -159,24 +190,38 @@ class ResearchBrief:
     def sources(self) -> str:
         return ",".join(self.programs)
 
-    def fetch_follow_ups(self, max_results: int) -> list[dict[str, str]]:
+    def fetch_follow_ups(
+        self,
+        max_results: int,
+        *,
+        max_airports_per_side: int | None = None,
+        max_date_span_days: int | None = None,
+        provider_max_results: int | None = None,
+    ) -> list[dict[str, str]]:
+        """Validate only the bounds advertised by the selected adapter.
+
+        The legacy compatibility adapter supplies its existing limits.  A future
+        hosted/licensed adapter can expose different limits (or none) without making
+        the provider-neutral brief/parser assume Seats.aero pagination rules.
+        """
+
         issues = list(self.follow_up_fields)
-        if len(self.origins) > MAX_AIRPORTS_PER_SIDE:
+        if max_airports_per_side is not None and len(self.origins) > max_airports_per_side:
             issues.append({
-                "field": "origin", "reason": f"Limit an API fetch to at most {MAX_AIRPORTS_PER_SIDE} origin IATA codes."
+                "field": "origin", "reason": f"Limit this provider fetch to at most {max_airports_per_side} origin IATA codes."
             })
-        if len(self.destinations) > MAX_AIRPORTS_PER_SIDE:
+        if max_airports_per_side is not None and len(self.destinations) > max_airports_per_side:
             issues.append({
-                "field": "destination", "reason": f"Limit an API fetch to at most {MAX_AIRPORTS_PER_SIDE} destination IATA codes."
+                "field": "destination", "reason": f"Limit this provider fetch to at most {max_airports_per_side} destination IATA codes."
             })
         span = self.date_span_days
-        if span is not None and span > MAX_FETCH_DATE_SPAN_DAYS:
+        if max_date_span_days is not None and span is not None and span > max_date_span_days:
             issues.append({
-                "field": "departure", "reason": f"Limit an API fetch to a {MAX_FETCH_DATE_SPAN_DAYS}-day departure window or less."
+                "field": "departure", "reason": f"Limit this provider fetch to a {max_date_span_days}-day departure window or less."
             })
-        if max_results > MAX_FETCH_RESULTS:
+        if provider_max_results is not None and max_results > provider_max_results:
             issues.append({
-                "field": "max_results", "reason": f"Limit an API fetch to {MAX_FETCH_RESULTS} availability summaries or fewer."
+                "field": "max_results", "reason": f"Limit this provider fetch to {provider_max_results} availability summaries or fewer."
             })
         return _unique_follow_ups(issues)
 
@@ -275,16 +320,30 @@ def _normalize_cabin(value: Any) -> str | None:
     return CABIN_ALIASES.get(normalized)
 
 
-def _normalize_program(value: str, programs: Mapping[str, str]) -> str | None:
+def _normalize_program(
+    value: str, programs: Mapping[str, str], *, allow_unknown_program_ids: bool = True
+) -> str | None:
+    """Resolve a provider catalog name or a portable canonical program id.
+
+    A brief must not need a particular provider's catalog just to name a redemption
+    program.  Known adapter catalogs still supply friendly-name aliases, while an
+    explicit lowercase id remains usable for a generic/manual provider.
+    """
+
     needle = re.sub(r"[^a-z0-9]+", "", value.lower())
     for source, name in programs.items():
         aliases = (source, name, name.replace("/", " "))
         if any(needle == re.sub(r"[^a-z0-9]+", "", alias.lower()) for alias in aliases):
             return source
+    canonical = value.strip().lower()
+    if allow_unknown_program_ids and re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", canonical):
+        return canonical
     return None
 
 
-def _normalize_programs(value: Any, programs: Mapping[str, str]) -> tuple[str, ...] | None:
+def _normalize_programs(
+    value: Any, programs: Mapping[str, str], *, allow_unknown_program_ids: bool = True
+) -> tuple[str, ...] | None:
     if value is None or value == "" or value == "all" or value == "all_supported":
         return ()
     if isinstance(value, str):
@@ -295,7 +354,9 @@ def _normalize_programs(value: Any, programs: Mapping[str, str]) -> tuple[str, .
         return None
     normalized: list[str] = []
     for item in values:
-        source = _normalize_program(item, programs)
+        source = _normalize_program(
+            item, programs, allow_unknown_program_ids=allow_unknown_program_ids
+        )
         if source is None:
             return None
         normalized.append(source)
@@ -337,11 +398,20 @@ def _normalise_transfer_profile_id(value: Any) -> str | None:
 
 
 def _normalise_reference_url(value: Any) -> str | None:
+    """Return a public-safe transfer reference URL without credentials or query data."""
+
     if not isinstance(value, str) or not value.strip():
         return None
-    url = value.strip()
-    parsed = urllib.parse.urlparse(url)
-    return url if parsed.scheme in {"http", "https"} and parsed.netloc else None
+    parsed = urllib.parse.urlsplit(value.strip())
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        return None
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc, parsed.path, "", ""))
 
 
 def transfer_profile_summary(profile: TransferProfile) -> dict[str, Any]:
@@ -395,7 +465,7 @@ def _parse_custom_transfer_profile(
             return None, f"Transfer source '{profile_id}' partner #{index} needs a supported redemption program."
         if program in seen_programs:
             return None, f"Transfer source '{profile_id}' defines '{program}' more than once."
-        recipient_name = partner.get("recipient_name", programs[program])
+        recipient_name = partner.get("recipient_name", programs.get(program, program))
         if not isinstance(recipient_name, str) or not recipient_name.strip():
             return None, f"Transfer source '{profile_id}' partner #{index} needs a recipient_name."
         rate = _positive_int(
@@ -596,7 +666,7 @@ def _apply_common_defaults(brief: ResearchBrief) -> None:
             brief.provenance["programs"] = "unresolved"
         else:
             brief.provenance["programs"] = "default"
-            brief.assumptions.append("All supported Seats.aero redemption programs are in scope.")
+            brief.assumptions.append("All redemption programs represented by the selected research source are in scope.")
     if "stops" not in brief.provenance:
         brief.provenance["stops"] = "default"
         brief.assumptions.append("Connections are allowed; known nonstop options are preferred in each local ranking.")
@@ -606,7 +676,9 @@ def _apply_common_defaults(brief: ResearchBrief) -> None:
         brief.provenance["transfer_sources"] = "not_configured"
 
 
-def _parse_structured_brief(data: Mapping[str, Any], programs: Mapping[str, str]) -> ResearchBrief:
+def _parse_structured_brief(
+    data: Mapping[str, Any], programs: Mapping[str, str], *, allow_unknown_program_ids: bool = True
+) -> ResearchBrief:
     brief = ResearchBrief(input_format="json")
     values: dict[str, Any] = dict(data)
     # Also accept the compact controller shape used in AI-facing workflows.
@@ -699,9 +771,11 @@ def _parse_structured_brief(data: Mapping[str, Any], programs: Mapping[str, str]
 
     program_value = values.get("programs", values.get("points_programs"))
     if program_value is not None:
-        selected_programs = _normalize_programs(program_value, programs)
+        selected_programs = _normalize_programs(
+            program_value, programs, allow_unknown_program_ids=allow_unknown_program_ids
+        )
         if selected_programs is None:
-            _append_issue(brief, "programs", "Use supported Seats.aero redemption program names or source IDs; run './flight programs' for the list.")
+            _append_issue(brief, "programs", "Use a provider-supported redemption-program name or a lowercase canonical program id (for example, aeroplan).")
         else:
             brief.programs = selected_programs
             brief.provenance["programs"] = "user"
@@ -786,20 +860,19 @@ def _parse_structured_brief(data: Mapping[str, Any], programs: Mapping[str, str]
     return brief
 
 
-def _text_programs(text: str, programs: Mapping[str, str]) -> tuple[str, ...]:
+def _text_programs(
+    text: str, programs: Mapping[str, str], *, allow_unknown_program_ids: bool = True
+) -> tuple[str, ...]:
     lowered = text.lower()
     found: list[str] = []
     for source, name in programs.items():
-        aliases = [source.replace("_", " "), name.lower()]
-        # A few short, unambiguous forms make a brief less verbose.
-        aliases.extend({
-            "aeroplan": ["air canada"],
-            "flyingblue": ["flying blue"],
-            "virginatlantic": ["virgin atlantic"],
-            "jetblue": ["jet blue"],
-        }.get(source, []))
+        aliases = [source.replace("_", " "), name.lower(), *GENERIC_PROGRAM_ALIASES.get(source, ())]
         if any(re.search(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", lowered) for alias in aliases):
             found.append(source)
+    if allow_unknown_program_ids:
+        for source, aliases in GENERIC_PROGRAM_ALIASES.items():
+            if any(re.search(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", lowered) for alias in aliases):
+                found.append(source)
     return tuple(dict.fromkeys(found))
 
 
@@ -814,7 +887,9 @@ def _text_transfer_profiles(text: str) -> tuple[TransferProfile, ...]:
     return tuple({profile.id: profile for profile in found}.values())
 
 
-def _parse_text_brief(text: str, programs: Mapping[str, str]) -> ResearchBrief:
+def _parse_text_brief(
+    text: str, programs: Mapping[str, str], *, allow_unknown_program_ids: bool = True
+) -> ResearchBrief:
     brief = ResearchBrief(input_format="text")
     normalized = " ".join(text.strip().split())
     lowered = normalized.lower()
@@ -932,7 +1007,9 @@ def _parse_text_brief(text: str, programs: Mapping[str, str]) -> ResearchBrief:
     elif cap_context:
         _append_issue(brief, "max_points", "Provide a positive whole-number point or mile cap.")
 
-    selected_programs = _text_programs(normalized, programs)
+    selected_programs = _text_programs(
+        normalized, programs, allow_unknown_program_ids=allow_unknown_program_ids
+    )
     if selected_programs:
         brief.programs = selected_programs
         brief.provenance["programs"] = "user"
@@ -947,7 +1024,12 @@ def _parse_text_brief(text: str, programs: Mapping[str, str]) -> ResearchBrief:
     return brief
 
 
-def parse_trip_brief(raw: str | Mapping[str, Any], programs: Mapping[str, str]) -> ResearchBrief:
+def parse_trip_brief(
+    raw: str | Mapping[str, Any],
+    programs: Mapping[str, str],
+    *,
+    allow_unknown_program_ids: bool = True,
+) -> ResearchBrief:
     """Parse JSON or a deliberately small, deterministic textual brief.
 
     City-name resolution, relative dates, and unlabelled airport-code pairs are left as
@@ -956,7 +1038,9 @@ def parse_trip_brief(raw: str | Mapping[str, Any], programs: Mapping[str, str]) 
     """
 
     if isinstance(raw, Mapping):
-        return _parse_structured_brief(raw, programs)
+        return _parse_structured_brief(
+            raw, programs, allow_unknown_program_ids=allow_unknown_program_ids
+        )
     if not isinstance(raw, str) or not raw.strip():
         brief = ResearchBrief()
         _append_issue(brief, "brief", "Provide a JSON trip brief or text such as 'SFO to CDG 2026-09-01 business 2 passengers'.")
@@ -976,8 +1060,12 @@ def parse_trip_brief(raw: str | Mapping[str, Any], programs: Mapping[str, str]) 
             _append_issue(brief, "brief", "The JSON trip brief must be an object, not a list or scalar.")
             _apply_common_defaults(brief)
             return brief
-        return _parse_structured_brief(decoded, programs)
-    return _parse_text_brief(text, programs)
+        return _parse_structured_brief(
+            decoded, programs, allow_unknown_program_ids=allow_unknown_program_ids
+        )
+    return _parse_text_brief(
+        text, programs, allow_unknown_program_ids=allow_unknown_program_ids
+    )
 
 
 def google_flights_handoff(brief: ResearchBrief) -> dict[str, Any]:
@@ -1012,9 +1100,10 @@ def google_flights_handoff(brief: ResearchBrief) -> dict[str, Any]:
         "scraped": False,
         "live_fares_obtained": False,
         "source_confidence": "manual_pending",
+        "data_sharing_notice": "Opening this URL sends the displayed trip query to Google; Flight Finder does not receive Google fare data.",
         "instructions": [
             "Open the URL in a browser and enter or confirm the visible route, dates, cabin, and passenger count.",
-            "This CLI does not scrape Google Flights and does not receive live fare data from Google.",
+            "Opening the URL shares that trip query with Google. This CLI does not scrape Google Flights and does not receive live fare data from Google.",
             "Optionally import a user-observed cash quote with itinerary and fare-inclusion evidence for a guarded CPP comparison.",
         ],
     }
@@ -1062,13 +1151,20 @@ def _normalise_observed_at(value: Any) -> str | None:
 
 
 def _normalise_evidence_url(value: Any) -> str | None:
+    """Keep a public-safe reference URL without userinfo, query, or fragment."""
+
     if not isinstance(value, str) or not value.strip():
         return None
-    url = value.strip()
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+    parsed = urllib.parse.urlsplit(value.strip())
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
         return None
-    return url
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc, parsed.path, "", ""))
 
 
 def _normalise_itinerary_evidence(value: Any) -> str | None:
@@ -1191,6 +1287,28 @@ def _quote_matches_candidate(quote: Mapping[str, Any], candidate: Mapping[str, A
     return True, None
 
 
+def _has_route_consistent_segments(candidate: Mapping[str, Any]) -> bool:
+    """Require a segment chain before treating a flight-level award as exact."""
+
+    segments = candidate.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return False
+    origin = candidate.get("origin")
+    destination = candidate.get("destination")
+    for index, segment in enumerate(segments):
+        if not isinstance(segment, Mapping):
+            return False
+        segment_origin = segment.get("origin")
+        segment_destination = segment.get("destination")
+        if not segment_origin or not segment_destination or segment_origin == segment_destination:
+            return False
+        if not segment.get("departs_at") or not segment.get("arrives_at"):
+            return False
+        if index and segments[index - 1].get("destination") != segment_origin:
+            return False
+    return segments[0].get("origin") == origin and segments[-1].get("destination") == destination
+
+
 def compare_award_to_cash(
     candidate: Mapping[str, Any],
     quotes: Sequence[Mapping[str, Any]],
@@ -1227,6 +1345,13 @@ def compare_award_to_cash(
                 "reason": "award is summary-only, so the exact itinerary cannot be compared to a cash quote",
             })
             continue
+        if not _has_route_consistent_segments(candidate):
+            comparisons.append({
+                **base,
+                "state": "not_comparable",
+                "reason": "award lacks a route-consistent flight-level itinerary, so the exact itinerary cannot be compared to a cash quote",
+            })
+            continue
         points = candidate.get("points")
         taxes = candidate.get("taxes_cents")
         award_currency = candidate.get("taxes_currency")
@@ -1239,6 +1364,12 @@ def compare_award_to_cash(
                 **base,
                 "state": "not_comparable",
                 "reason": f"cash is {quote['currency']} while award taxes are {award_currency}; no currency conversion is assumed",
+            })
+        elif not isinstance(candidate.get("taxes_per_passenger"), bool):
+            comparisons.append({
+                **base,
+                "state": "not_comparable",
+                "reason": "award tax scope is not reported, so CPP cannot safely calculate party taxes",
             })
         else:
             direct_transfers = [
@@ -1253,8 +1384,8 @@ def compare_award_to_cash(
                 })
                 continue
             total_cash = _quote_total_cents(quote, passengers)
-            total_points = int(points) * passengers
-            total_taxes = int(taxes) * passengers
+            total_points = int(points) * passengers if candidate.get("award_per_passenger", True) else int(points)
+            total_taxes = int(taxes) * passengers if candidate["taxes_per_passenger"] else int(taxes)
             for transfer in direct_transfers:
                 source_points = int(transfer["source_points_to_transfer"])
                 # Cash values are stored in cents, so dividing by transferable points
@@ -1298,7 +1429,7 @@ def _transfer_requirement(
         return {
             **base,
             "status": "requires_manual_confirmation",
-            "reason": "The configured point-source target is not automatically interchangeable with the Seats.aero redemption program.",
+            "reason": "The configured point-source target is not automatically interchangeable with this redemption program.",
             "source_points_to_transfer": None,
             "recipient_points_received": None,
         }
@@ -1383,17 +1514,38 @@ def group_award_recommendations(
     limit_per_bucket: int,
     transfer_profiles: Sequence[TransferProfile] = (),
 ) -> list[dict[str, Any]]:
-    """Preserve every redemption-program source and isolate non-comparable tax currencies."""
+    """Group by provider *and* program without comparing tax currencies.
 
-    by_program: dict[str, list[Mapping[str, Any]]] = {}
+    The ranking and transfer logic intentionally consumes the normalized candidate
+    fields only.  Two providers' records for the same program therefore remain
+    separate rather than being silently conflated.
+    """
+
+    by_provider_program: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    provider_names: dict[str, str] = {}
+    program_display_names: dict[tuple[str, str], str] = {}
     for candidate in candidates:
+        provider = str(candidate.get("provider_id") or candidate.get("provider") or "unknown_provider").lower()
         program = str(candidate.get("program") or "unknown").lower()
-        by_program.setdefault(program, []).append(candidate)
+        key = (provider, program)
+        by_provider_program.setdefault(key, []).append(candidate)
+        provider_names.setdefault(provider, str(candidate.get("provider_name") or provider))
+        program_display_names.setdefault(
+            key, str(candidate.get("program_name") or program_names.get(program, program))
+        )
 
     groups: list[dict[str, Any]] = []
-    for program in sorted(by_program, key=lambda item: (program_names.get(item, item).lower(), item)):
+    for provider, program in sorted(
+        by_provider_program,
+        key=lambda item: (
+            provider_names[item[0]].lower(),
+            program_display_names[item].lower(),
+            item[0],
+            item[1],
+        ),
+    ):
         by_currency: dict[str, list[Mapping[str, Any]]] = {}
-        for candidate in by_program[program]:
+        for candidate in by_provider_program[(provider, program)]:
             currency = str(candidate.get("taxes_currency") or "unknown").upper()
             by_currency.setdefault(currency, []).append(candidate)
         buckets: list[dict[str, Any]] = []
@@ -1405,15 +1557,25 @@ def group_award_recommendations(
                 # score compares tax cents. Never expose that score in research output.
                 candidate.pop("score", None)
                 award_points = candidate.get("points")
-                total_points = int(award_points) * brief.passengers if isinstance(award_points, int) and award_points > 0 else None
+                total_points = (
+                    int(award_points) * brief.passengers
+                    if isinstance(award_points, int) and award_points > 0 and candidate.get("award_per_passenger", True)
+                    else int(award_points) if isinstance(award_points, int) and award_points > 0 else None
+                )
                 candidate["research_evidence"] = {
-                    "provider": "seats.aero",
-                    "provider_mode": "cached_availability",
+                    "provider": provider,
+                    "provider_name": provider_names[provider],
+                    "provider_mode": candidate.get("provider_mode", "unknown"),
+                    "provider_observation_state": candidate.get("provider_observation_state", "unknown"),
+                    "verification_status": candidate.get("verification_status", "not_independently_verified"),
+                    "imported_manually": bool(candidate.get("imported_manually")),
                     "redemption_program": program,
+                    "redemption_program_name": program_display_names[(provider, program)],
                     "source_updated_at": candidate.get("source_updated_at"),
                     "fetched_at": candidate.get("fetched_at"),
                     "detail_level": "flight_level" if candidate.get("kind") == "trip" else "summary_only",
-                    "seat_confidence": _seat_confidence(candidate),
+                    "seat_confidence": candidate.get("seat_confidence") or _seat_confidence(candidate),
+                    "taxes_per_passenger": candidate.get("taxes_per_passenger"),
                 }
                 candidate["party_award_points"] = total_points
                 candidate["transfer_access"] = transfer_options(program, total_points, transfer_profiles)
@@ -1424,14 +1586,15 @@ def group_award_recommendations(
                 recommendations.append(candidate)
             buckets.append({
                 "tax_currency": None if currency == "UNKNOWN" else currency,
-                "ranking_scope": "Within this redemption program and one tax-currency bucket; known nonstop options first, then award points, seat confidence, and detail level.",
+                "ranking_scope": "Within this provider, redemption program, and one tax-currency bucket; known nonstop options first, then award points, seat confidence, and detail level.",
                 "recommendations": recommendations,
             })
         groups.append({
             "program": program,
-            "program_name": program_names.get(program, program),
-            "provider": "seats.aero",
-            "ranking_scope": "No cross-program or cross-currency winner is claimed.",
+            "program_name": program_display_names[(provider, program)],
+            "provider": provider,
+            "provider_name": provider_names[provider],
+            "ranking_scope": "No cross-provider, cross-program, or cross-currency winner is claimed.",
             "tax_currency_buckets": buckets,
         })
     return groups

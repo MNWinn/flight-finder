@@ -1,113 +1,133 @@
 # Flight Finder
 
-A dependency-free Python CLI for researching award flights with the Seats.aero Pro API and a Google Flights manual comparison handoff. It fetches cached availability, stores normalized and raw data in local SQLite, and ranks options by points, taxes, stops, and seat-count confidence.
+Flight Finder is a dependency-free Python CLI for explainable award-flight research. Its default workflow is **no-login local research**: supply normalized award offers you are allowed to use, rank them locally, and receive a manual Google Flights browser handoff for cash comparison. It does not book travel, transfer points, scrape sites, automate a browser, or guarantee availability.
 
 - **Runtime:** Python 3.10+ standard library only
-- **Database:** `data/flights.sqlite3` (created automatically)
-- **Secret:** `.env` (ignored by Git and readable only by the local user)
-- **API:** Seats.aero cached search and trip-detail endpoints
+- **Default award source:** local normalized `manual_import` (no network, key, or third-party account)
+- **Optional compatibility source:** explicit `--provider seats.aero` with an eligible local key
+- **Cash comparison:** user-observed imports plus a manual Google Flights handoff only
 
-## Quick start
+## Quick start: no-login local research
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
-./flight init
+./flight providers --json
 
-# Fetch and cache business awards (one API call in the usual case)
-./flight search \
-  --from SFO,LAX \
-  --to LHR,CDG \
-  --start 2026-09-01 \
-  --end 2026-09-07 \
-  --cabin business \
-  --seats 2
+# Cache-free, DB-free, no-key research; it reports how to add local offers.
+./flight research '{"origin":"SFO","destination":"CDG","departure_date":"2026-09-01"}' --json
 
-# Re-rank the latest stored search without making an API call
-./flight results --sort best --limit 20
-
-# Machine-readable or report output for an AI/user
-./flight results --json
-./flight results --markdown
+# Put user-approved JSON in the project-controlled import sandbox, then rank it
+# locally. No provider request, key, or SQLite database is used.
+mkdir -p imports
+./flight research '{"origin":"SFO","destination":"CDG","departure_date":"2026-09-01"}' \
+  --award-offer-file imports/award-offers.json --json
 ```
 
-The provided Seats.aero key is stored locally in `.env`; the CLI never puts it in command arguments or SQLite. To replace it, edit `.env` or set `SEATS_AERO_API_KEY` in the environment.
+`research` returns a structured brief, assumptions, provenance, source status, grouped recommendations, optional transfer-source math, and a Google Flights **manual** handoff. A resolved manual-import brief can run without a provider key, account, database, or network request. `./flight init` is only needed for the optional legacy SQLite cache commands.
 
-## Research: award cache + manual cash comparison
+### Optional Pi `/research` workflow
 
-`research` is the AI-facing, cache-first workflow. It accepts a compact JSON brief (preferred for agents) or a deliberately constrained text brief, returns a structured report with field provenance and follow-ups, and **does not make an API call unless `--fetch` is explicit**.
+In a trusted Pi project, `.pi/prompts/research.md` registers `/research <trip request>`. Reload/restart Pi after cloning. The prompt normalizes terse requests and runs the no-login local workflow first; it never invents award results, scrapes sites, or selects a BYO/hosted provider without explicit authorization. Until a licensed provider adapter is added, it needs a permitted normalized award-offer import to return award options.
+
+## Provider boundary
+
+Run `./flight providers --json` for the current capability manifest.
+
+| Source | Default | Network/key | Meaning |
+| --- | --- | --- | --- |
+| `manual_import` | yes | no | Local normalized award-offer JSON; user-supplied and not independently verified. |
+| `seats.aero` | no | only on explicit `--fetch`, with an eligible local key | Legacy BYO compatibility adapter for cached award availability. |
+| Google Flights handoff | n/a | no data retrieval | Opens a user-operated browser search only. |
+| manual cash import | n/a | no | User-asserted cash observation for guarded CPP math. |
+
+The adapter registry is intentionally small and explicit. A future licensed provider or hosted backend implements the normalized adapter contract; ranking, transfer-source comparisons, and response shapes do not need to change. Flight Finder never silently falls back from an unavailable licensed source to scraping or an unlicensed source.
+
+### Optional legacy Seats.aero path
+
+The legacy `search`, `results`, `trips`, `searches`, and `programs` commands remain available. They are Seats.aero-specific compatibility commands. A `SEATS_AERO_API_KEY` is needed only for direct `search`/`trips` or this explicitly selected research refresh:
 
 ```bash
-# JSON brief: useful for an AI/controller
-./flight research '{
-  "journey": "one_way",
-  "legs": [{
-    "origin": ["SFO"],
-    "destination": ["CDG"],
-    "departure": {"start": "2026-09-01", "end": "2026-09-03"}
-  }],
-  "passengers": {"count": 2},
-  "cabin": {"primary": "business"},
-  "points": {"programs": ["aeroplan", "flyingblue"], "max_points": 90000},
-  "stops": {"preference": "prefer_nonstop_allow_connections"}
-}' --json
-
-# Deterministic text form; use IATA codes and ISO dates.
-./flight research 'SFO to CDG 2026-09-01 business 2 passengers Aeroplan' --json
-
-# Explicitly refresh a cache miss/stale exact cache with one bounded Seats.aero search.
 ./flight research '{"origin":"SFO","destination":"CDG","departure_date":"2026-09-01"}' \
-  --fetch --max-results 100 --json
+  --provider seats.aero --fetch --max-results 100 --json
 ```
 
-### Optional Pi `/research` prompt
+That adapter reads its local legacy cache without a request, but it is never the default research provider. Its result is cached provider availability, not live inventory. Legacy records without a validated tax scope remain visible but do not produce CPP. Use it only when your account, key, and intended use are authorized by the provider.
 
-For a Pi session in this trusted project, `.pi/prompts/research.md` registers `/research <trip request>`. The controller turns a concise request into one explicit JSON brief per leg, transparently resolves routine city/date shorthand, researches return legs separately, and uses a bounded Seats.aero cache fill when needed. It asks only for material ambiguity and never scrapes Google Flights, books, or transfers points. Reload/restart Pi after adding project prompts.
+## Normalized award-offer import contract
 
-### Brief rules and safe defaults
-
-- The raw CLI deliberately requires origin/destination **IATA codes** and an ISO departure date/range. The Pi `/research` controller handles a concise natural-language request: it can resolve a conventional city airport, keep an explicitly stated airport as the preference, resolve routine US-style dates to an explicit upcoming year, and split a stated return into outbound/return legs. It always discloses those assumptions and asks only when a mapping, date, or party size would materially change the search.
-- If omitted, cabin defaults to `business` for award research (`economy` for explicit `cash_only`), passengers to `1`, supported award programs to all available Seats.aero sources, and connections remain allowed. Those defaults are emitted in `brief.assumptions` and `brief.provenance` rather than represented as user facts.
-- `--fetch` permits at most three IATA codes on each side, a 14-day departure window, at most 100 summaries, and one logical cached-search response. A fresh exact local cache (24 hours by default; adjust with `--cache-ttl-hours`) is reused only when its stored result cap is not potentially truncated and it included embedded trip details. The report exposes cache coverage; capped or summary-only caches are labeled partial. `/research` treats the user's flight-search request as approval for this one bounded cache fill per leg; direct CLI use still requires explicit `--fetch`.
-- Results stay grouped by **redemption program** and tax currency. The report intentionally does not declare a cross-program or cross-currency winner.
-
-### Google Flights handoff and manual cash imports
-
-Every award-first report with a resolved route/date/cabin/passenger brief includes an openable Google Flights browser URL and the visible query text. This is a **manual handoff only**: the CLI does not scrape Google Flights, automate a browser, call a Google fare API, or claim to receive live fares. Confirm the route, date, cabin, passengers, and fare terms in the browser.
-
-To add a fare you observed yourself, import JSON. The CLI labels it as a manual user observation (`manual_verified` or `manual_unverified`) and never promotes an import to a live/API fare; it does not independently verify it. CPP additionally needs a timezone-aware `observed_at` and either a valid `booking_url` or `itinerary_evidence`; any resulting CPP is explicitly labeled **user-asserted**.
+Pass one object, a JSON list, or `{ "offers": [...] }` with `--award-offer` or `--award-offer-file`. Inline JSON avoids file access. Every `--*-file` JSON option is limited to regular, non-symlink files below the project-controlled `imports/` or `examples/` roots, rejects `.env`/`.env.*`, and has a 1 MB limit. The importer validates and allowlists normalized fields; it does not retain or report an arbitrary raw provider payload. Manual imports are per-command local input in this vertical slice; they are not a claimed live cache.
 
 ```json
 {
-  "provider": "google_flights",
-  "total": 1234.56,
-  "currency": "USD",
-  "amount_scope": "total",
-  "origin": "SFO",
-  "destination": "CDG",
-  "departure_date": "2026-09-01",
+  "schema_version": 1,
+  "offer_id": "licensed_demo:offer:opaque-id",
+  "provider": {
+    "id": "licensed_demo",
+    "name": "Licensed Demo Provider"
+  },
+  "provider_offer_id": "opaque-id",
+  "redemption_program": {
+    "id": "aeroplan",
+    "name": "Air Canada Aeroplan",
+    "provider_program_id": "provider-program-id"
+  },
+  "itinerary": {
+    "origin": "SFO",
+    "destination": "CDG",
+    "departure_date": "2026-09-01",
+    "segments": [
+      {
+        "origin": "SFO",
+        "destination": "CDG",
+        "departs_at": "2026-09-01T10:00:00Z",
+        "arrives_at": "2026-09-02T05:00:00Z",
+        "operating_carrier": "UA",
+        "marketing_carrier": "UA",
+        "flight_number": "UA990"
+      }
+    ],
+    "operating_carriers": ["UA"],
+    "marketing_carriers": ["UA"]
+  },
   "cabin": "business",
-  "passengers": 1,
-  "same_itinerary": true,
-  "fare_inclusions_match": true,
-  "fare_inclusions": "Comparable baggage and fare rules confirmed",
-  "observed_at": "2026-01-01T12:00:00Z",
-  "booking_url": "https://www.google.com/travel/flights",
-  "itinerary_evidence": "Flight numbers/schedule reviewed in the browser"
+  "award": {"points": 50000, "per_passenger": true},
+  "taxes": {"cents": 560, "currency": "USD", "symbol": "$", "per_passenger": true},
+  "seat_availability": {"count": 2, "confidence": "reported"},
+  "detail_level": "flight_level",
+  "booking_links": [{"url": "https://provider.example/book", "label": "Provider link"}],
+  "evidence": {
+    "availability_mode": "manual_import",
+    "source_updated_at": "2026-01-01T11:30:00Z",
+    "fetched_at": "2026-01-01T12:00:00Z"
+  }
 }
 ```
 
+Validation requires provider provenance, provider-scoped identifiers, a separate redemption program, route/date/cabin/award fields, fees/tax currency **and scope**, seat confidence, detail level, and route-consistent `origin`/`destination`/`departs_at`/`arrives_at` segments for `flight_level`, plus an offset-aware evidence timestamp. `fees` is accepted as an input alias for `taxes`.
+
+Safety rules:
+
+- Provider IDs namespace opaque offer IDs, so two sources cannot collide just because they reuse a raw ID.
+- Redemption program, operating carrier, marketing carrier, and provider are separate fields.
+- `seat_availability.count: 0` or an unknown/estimated count stays **unknown**; it is not displayed or filtered as sold out.
+- Tax/fee amounts are grouped by currency. `taxes.per_passenger` is required for imported offers; CPP is suppressed when a provider cannot establish tax scope. Flight Finder never converts currencies or declares a cross-currency winner.
+- Manual imports preserve a stated `cached_availability`, `provider_live_offer`, or licensed mode, but are always marked `imported_manually` and `not_independently_verified`. A source claim is not a Flight Finder verification or availability guarantee. Import completeness is always `unknown_unverified`; the report surfaces the newest supplied evidence time/age rather than claiming coverage.
+- Recommendations are grouped by **provider, redemption program, and tax currency**. Ranking is only within that bucket.
+
+Use `--fetch` with the default local-import provider only to receive a no-network explanation; it never loads credentials. A fetching adapter must be selected explicitly.
+
+## Briefs, ranking, and transfer sources
+
+A brief accepts JSON (preferred) or constrained IATA/ISO-date text:
+
 ```bash
-./flight research '{"origin":"SFO","destination":"CDG","departure_date":"2026-09-01"}' \
-  --cash-quote-file cash-quote.json --json
+./flight research 'SFO to CDG 2026-09-01 business 2 passengers' \
+  --award-offer-file imports/award-offers.json --json
 ```
 
-CPP is shown only as `user_asserted_comparable` when the imported quote explicitly matches the award route, date, cabin, passenger count, fare inclusions, timestamp, evidence reference, and tax currency. It uses the smallest configured transferable-point amount after its ratio and increment rounding; it never performs an unstated currency conversion or independently validates the fare.
+If omitted, cabin defaults to business for award research (economy for explicit `cash_only`), passengers to one, all programs represented by the selected source, and connections are allowed with known nonstop options preferred. These are emitted as assumptions/provenance, not fabricated user facts.
 
-### Configurable transfer sources
-
-Flight Finder is not limited to any card issuer or rewards currency. Award searches work without a transfer profile; add one only when you want transfer math and CPP comparisons. A profile is selected in `transfer_sources` within the brief or supplied with `--transfer-profile` / `--transfer-profile-file`.
-
-Two optional, static convenience profiles are bundled: `chase_ultimate_rewards` and `capital_one_miles`. They are never selected unless the request explicitly names them. Any other transferable currency, loyalty balance, or future provider can use the same public JSON schema:
+Transfer sources are fully optional. Award research works without a card issuer, loyalty balance, or transfer profile. Add a public static/user-supplied profile only when transfer math or CPP comparison is useful:
 
 ```json
 {
@@ -122,95 +142,30 @@ Two optional, static convenience profiles are bundled: `chase_ultimate_rewards` 
       "recipient_name": "Air Canada Aeroplan",
       "recipient_per_1000_source_points": 1000,
       "minimum_source_points": 1000,
-      "source_increment": 1000,
-      "source_url": "https://issuer.example/transfer-partners/aeroplan"
+      "source_increment": 1000
     }
   ]
 }
 ```
 
-```bash
-./flight research '{"origin":"SFO","destination":"CDG","departure_date":"2026-09-01"}' \
-  --transfer-profile-file examples/transfer-profile.example.json --json
-```
+Supply it in `transfer_sources` within the brief or via `--transfer-profile` / `--transfer-profile-file`. Profiles contain public terms only—never account numbers, balances, traveler data, or credentials. Verify partner eligibility, ratios, timing, award space, and fees before any irreversible transfer.
 
-See [`examples/transfer-profile.example.json`](examples/transfer-profile.example.json). Profiles contain only public transfer terms—never put account numbers, balances, personal identifiers, or credentials in them. Partners, ratios, and timing can change, so verify each rule at its official source before moving points.
+## Google Flights and manual cash imports
 
-## Commands
+`cash_search.url` is a user-operated Google Flights browser handoff. Opening it sends the displayed route/date/cabin/passenger query to Google. Flight Finder does **not** scrape Google Flights, call undocumented endpoints, automate a browser, call a Google fare API, or receive Google fare data.
 
-### Search and store
+A user-observed cash quote can be imported with `--cash-quote` or `--cash-quote-file`. It needs total/per-passenger scope, ISO currency, route/date/cabin/passenger evidence, `same_itinerary: true`, `fare_inclusions_match: true`, an offset-aware `observed_at`, and a booking/search URL or itinerary reference before CPP can be calculated. User-supplied booking/reference URLs are projected without userinfo, query parameters, or fragments in public output. Any CPP is `user_asserted_comparable`, never independently verified.
 
-```bash
-./flight search --from JFK --to CDG --start 2026-10-10 --end 2026-10-15 \
-  --cabin business,first --seats 2 --direct --max-results 100
-```
+## Hosted-product boundary
 
-Useful filters:
+A hosted no-login product must use providers licensed for its production/commercial use, downstream display/deep links, attribution, cache/retention, exports/raw payloads, geography, and anonymous end users. It should disclose source availability, freshness, coverage, rate limits, retention, and provider-specific limitations. When a licensed source cannot answer, report `unavailable`, `partial`, or `not_covered`; do not substitute scraping, airline login, browser automation, or an unlicensed provider.
 
-- `--programs aeroplan,flyingblue`: Seats.aero mileage-program source names
-- `--carriers AF,DL`: operating/marketing carrier filter supported by the API
-- `--direct`: request and display known nonstop results
-- `--summary-only`: omit embedded flight details for smaller responses
-- `--max-results N`: cache at most N availability summaries; over 1,000 may use multiple API calls
-- `--json` / `--markdown`: structured output instead of a terminal table
+## Data and safety
 
-Run `./flight programs` for valid program names. Search is one-way; run separate searches for outbound and return dates.
-
-### Rank the local cache
-
-```bash
-./flight searches
-./flight results --search-id 3 --cabin business --seats 2 \
-  --max-points 80000 --max-stops 1 --programs aeroplan --sort best
-```
-
-`results` never calls Seats.aero. Sort choices are `best`, `points`, `taxes`, and `date`. The `best` score combines:
-
-- award points;
-- cash taxes converted at `--cpp` (default 1.5 cents per point);
-- a 5,000-point penalty per stop;
-- small penalties for unknown seat counts or summary-only data.
-
-The score is a ranking aid, not a cash valuation or booking guarantee.
-
-### Fetch exact flight details
-
-A `summary` row has an availability ID in JSON output. Fetch its flights with:
-
-```bash
-./flight trips AVAILABILITY_ID
-./flight trips AVAILABILITY_ID --json
-```
-
-This calls `/partnerapi/trips/{id}`, then stores flight numbers, schedules, aircraft, fare class, stops, seats, taxes, and booking links.
-
-### Inspect storage and API usage
-
-```bash
-./flight stats
-./flight searches --json
-sqlite3 data/flights.sqlite3 '.tables'
-```
-
-`stats` counts API attempts made by this CLI today in UTC. Seats.aero states that eligible Pro accounts generally have a 1,000-call daily limit, reset at midnight UTC.
-
-## Optional command from anywhere
-
-Add a shell alias:
-
-```bash
-alias flight='/absolute/path/to/flight-finder/flight'
-```
-
-Replace the placeholder with your clone location and put it in `~/.zshrc` to keep it across terminal sessions.
-
-## Data and safety notes
-
-- `.env`, local search data, exports, and common credential-file formats are Git-ignored. Never commit account balances, booking details, personal travel history, or API keys.
-- A seat count shown as `?` was not reported. Some programs return zero when the count is unknown, so unknown inventory stays visible even with `--seats`.
-- Cached award space can be stale or phantom. Confirm on the mileage program's site **before transferring points**.
-- Taxes are ranked only when Seats.aero reports them; some programs do not.
-- The Seats.aero Pro API is for eligible users' personal, non-commercial use unless Seats.aero gives written commercial permission.
+- Do not read, print, log, source, or commit `.env` or any secret.
+- Local search data and imports can contain sensitive travel information; keep them private.
+- Confirm award space and final price with the redemption/booking provider before moving points or booking.
+- Flight Finder does not book, ticket, hold fares, transfer points, or guarantee price/availability.
 
 ## Tests
 

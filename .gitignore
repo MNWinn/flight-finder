@@ -11,6 +11,7 @@ credentials*.json
 # Local search data may contain personal travel history and raw provider responses.
 data/
 exports/
+imports/
 
 # Python/editor noise
 __pycache__/

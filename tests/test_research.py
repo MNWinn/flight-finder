@@ -233,6 +233,7 @@ class HandoffAndComparisonTests(unittest.TestCase):
         self.assertEqual(handoff["provider"], "google_flights")
         self.assertFalse(handoff["scraped"])
         self.assertFalse(handoff["live_fares_obtained"])
+        self.assertIn("sends the displayed trip query to Google", handoff["data_sharing_notice"])
         self.assertIn("google.com/travel/flights", handoff["url"])
         self.assertIn("SFO", handoff["query_text"])
 
@@ -276,9 +277,13 @@ class HandoffAndComparisonTests(unittest.TestCase):
         self.assertEqual(issues, [])
         comparisons = research.compare_award_to_cash(
             {
-                "origin": "SFO", "destination": "JFK", "date": "2026-09-01",
+                "kind": "trip", "origin": "SFO", "destination": "JFK", "date": "2026-09-01",
                 "cabin": "business", "points": 45000, "taxes_cents": 560,
-                "taxes_currency": "USD",
+                "taxes_currency": "USD", "taxes_per_passenger": True,
+                "segments": [{
+                    "origin": "SFO", "destination": "JFK",
+                    "departs_at": "2026-09-01T08:00:00Z", "arrives_at": "2026-09-01T16:00:00Z",
+                }],
             },
             quotes,
             1,
@@ -291,6 +296,17 @@ class HandoffAndComparisonTests(unittest.TestCase):
         self.assertAlmostEqual(cpp_by_source["chase_ultimate_rewards"], 2.21, places=2)
         self.assertAlmostEqual(cpp_by_source["capital_one_miles"], 1.326, places=3)
         self.assertTrue(all(item["verification_required"] for item in comparisons))
+
+    def test_user_supplied_reference_urls_are_public_safe(self):
+        profile = json.loads(json.dumps(GENERIC_TRANSFER_PROFILE))
+        profile["source_url"] = "https://example.test/rewards?session=demo#fragment"
+        profile["partners"][0]["source_url"] = "https://example.test/rewards/aeroplan?token=demo"
+        profiles, error = research.parse_transfer_profiles([profile], flights.PROGRAMS)
+
+        self.assertIsNone(error)
+        self.assertEqual(profiles[0].source_url, "https://example.test/rewards")
+        transfer = research.transfer_options("aeroplan", 50000, profiles)[0]
+        self.assertEqual(transfer["source_url"], "https://example.test/rewards/aeroplan")
 
     def test_builtin_profiles_are_optional_and_do_not_imply_other_sources(self):
         profiles, error = research.parse_transfer_profiles(
@@ -451,9 +467,13 @@ class HandoffAndComparisonTests(unittest.TestCase):
         }])
         comparison = research.compare_award_to_cash(
             {
-                "origin": "SFO", "destination": "JFK", "date": "2026-09-01",
+                "kind": "trip", "origin": "SFO", "destination": "JFK", "date": "2026-09-01",
                 "cabin": "business", "points": 50000, "taxes_cents": 500,
-                "taxes_currency": "USD",
+                "taxes_currency": "USD", "taxes_per_passenger": True,
+                "segments": [{
+                    "origin": "SFO", "destination": "JFK",
+                    "departs_at": "2026-09-01T08:00:00Z", "arrives_at": "2026-09-01T16:00:00Z",
+                }],
             },
             quotes,
             1,
@@ -494,7 +514,7 @@ class CacheAndRunTests(unittest.TestCase):
     def _args(self, *extra):
         parser = flights.make_parser()
         args = parser.parse_args([
-            "research",
+            "research", "--provider", "seats.aero",
             '{"origin":"SFO","destination":"CDG","departure_date":"2026-09-01"}',
             "--json",
             *extra,
@@ -588,15 +608,16 @@ class CacheAndRunTests(unittest.TestCase):
         self.assertIn("Field sources:", rendered)
         self.assertIn("Transfer sources: Example Rewards", rendered)
         self.assertIn("Transfer reference", rendered)
-        self.assertIn("User-asserted CPP", rendered)
+        self.assertIn("route-consistent flight-level itinerary", rendered)
 
     def test_transfer_profile_file_accepts_generic_profile_without_defaulting_issuers(self):
         self._stored_search()
         profile_path = Path(self.temp.name) / "transfer-profile.json"
         profile_path.write_text(json.dumps({"profiles": [GENERIC_TRANSFER_PROFILE]}), encoding="utf-8")
-        report = flights.run_research(
-            self.db, self._args("--transfer-profile-file", str(profile_path))
-        )
+        with mock.patch.object(flights, "TRUSTED_IMPORT_ROOTS", (Path(self.temp.name),)):
+            report = flights.run_research(
+                self.db, self._args("--transfer-profile-file", str(profile_path))
+            )
         selected = report["transfer_reference"]["selected_profiles"]
         self.assertEqual([profile["id"] for profile in selected], ["example_rewards"])
         recommendation = report["award_search"]["recommendations_by_program"][0]["tax_currency_buckets"][0]["recommendations"][0]
@@ -605,9 +626,10 @@ class CacheAndRunTests(unittest.TestCase):
     def test_transfer_profile_file_rejects_environment_file(self):
         environment_file = Path(self.temp.name) / ".env"
         environment_file.write_text("this-file-must-not-be-read", encoding="utf-8")
-        report = flights.run_research(
-            self.db, self._args("--transfer-profile-file", str(environment_file))
-        )
+        with mock.patch.object(flights, "TRUSTED_IMPORT_ROOTS", (Path(self.temp.name),)):
+            report = flights.run_research(
+                self.db, self._args("--transfer-profile-file", str(environment_file))
+            )
         self.assertIn("transfer_sources", {item["field"] for item in report["follow_up_fields"]})
         self.assertEqual(report["transfer_reference"]["selected_profiles"], [])
 
@@ -631,7 +653,7 @@ class CacheAndRunTests(unittest.TestCase):
     def test_fetch_bounds_are_reported_as_follow_ups_without_loading_credentials(self):
         parser = flights.make_parser()
         args = parser.parse_args([
-            "research",
+            "research", "--provider", "seats.aero",
             '{"origin":"SFO,LAX,JFK,ORD","destination":"CDG","departure_date":"2026-09-01"}',
             "--fetch", "--json",
         ])
@@ -647,18 +669,55 @@ class CacheAndRunTests(unittest.TestCase):
         fetcher.assert_not_called()
         prepare_api.assert_not_called()
 
+    def test_seats_adapter_rejects_unknown_program_ids_and_case_normalizes_its_limit(self):
+        parser = flights.make_parser()
+        too_small = parser.parse_args([
+            "research", "--provider", "SEATS.AERO", "--max-results", "1",
+            '{"origin":"SFO","destination":"CDG","departure_date":"2026-09-01"}', "--json",
+        ])
+        with self.assertRaises(flights.FlightError):
+            flights.ensure_positive(too_small)
+
+        args = parser.parse_args([
+            "research", "--provider", "seats.aero",
+            '{"origin":"SFO","destination":"CDG","departure_date":"2026-09-01",'
+            '"points":{"programs":["not_a_seats_program"]}}',
+            "--fetch", "--json",
+        ])
+        flights.ensure_positive(args)
+        fetcher = mock.Mock(side_effect=AssertionError("unknown Seats program must not reach fetcher"))
+        prepare_api = mock.Mock(side_effect=AssertionError("unknown Seats program must not load credentials"))
+        report = flights.run_research(self.db, args, fetcher=fetcher, prepare_api=prepare_api)
+
+        self.assertEqual(report["status"], "needs_clarification")
+        self.assertIn("programs", {item["field"] for item in report["follow_up_fields"]})
+        fetcher.assert_not_called()
+        prepare_api.assert_not_called()
+
+    def test_init_does_not_load_dotenv(self):
+        output = io.StringIO()
+        db_path = Path(self.temp.name) / "init.sqlite3"
+        with mock.patch.object(flights, "load_dotenv", side_effect=AssertionError("init must not load dotenv")):
+            with redirect_stdout(output):
+                result = flights.main(["--db", str(db_path), "init"])
+        self.assertEqual(result, 0)
+        self.assertIn("Initialized", output.getvalue())
+
     def test_main_research_dry_run_does_not_load_dotenv(self):
         output = io.StringIO()
         db_path = Path(self.temp.name) / "main.sqlite3"
-        with mock.patch.object(flights, "load_dotenv", side_effect=AssertionError("must not load")):
+        with mock.patch.object(flights, "load_dotenv", side_effect=AssertionError("must not load")), \
+             mock.patch.object(flights, "Database", side_effect=AssertionError("manual research must not open a database")):
             with redirect_stdout(output):
                 result = flights.main([
                     "--db", str(db_path), "research", "--brief",
-                    '{"origin":"SFO","destination":"CDG","departure_date":"2026-09-01"}', "--json",
+                    '{"origin":"SFO","destination":"CDG","departure_date":"2026-09-01"}', "--fetch", "--json",
                 ])
         self.assertEqual(result, 0)
         parsed = json.loads(output.getvalue())
-        self.assertEqual(parsed["award_search"]["status"], "cache_miss")
+        self.assertEqual(parsed["award_search"]["status"], "manual_import_empty")
+        self.assertEqual(parsed["award_search"]["provider"], "manual_import")
+        self.assertEqual(parsed["award_search"]["fetch"]["status"], "not_supported")
 
 
 if __name__ == "__main__":

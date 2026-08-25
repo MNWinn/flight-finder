@@ -1,57 +1,65 @@
-# Agent workflow for flight research
+# Agent workflow for Flight Finder
 
-Use the local `./flight` CLI. Do not read, print, log, or paste `.env` or any secret. Do not call Seats.aero when a local cache can answer the request. Never book, transfer points, or make another irreversible action for a user.
+Use the local `./flight` CLI for non-transactional flight research. Do not read, print, log, source, or paste `.env` or any secret. Never book, hold a fare, transfer points, sign in to an airline/loyalty account, or make another irreversible action for a user.
 
-## Start with `research`
+## Product boundary
 
-For a concise request, first turn it into one explicit JSON brief per leg, then use the local CLI:
+Flight Finder's default research provider is `manual_import`: local normalized award-offer JSON with **no provider account, key, database, or network request**. It is useful for no-login research and should be the first path for agents.
 
 ```bash
 cd "$(git rev-parse --show-toplevel)"
+./flight providers --json
 ./flight research '{"origin":"SFO","destination":"CDG","departure_date":"2026-09-01"}' --json
 ```
 
-`research` is cache-only by default. It returns `brief`, `assumptions`, `provenance`, and `follow_up_fields`; preserve those fields in the response rather than presenting an inference as a user fact.
+The report returns `brief`, `assumptions`, `provenance`, `follow_up_fields`, `award_search`, and per-offer evidence. Preserve those fields rather than presenting an inference, user import, cache record, or source claim as a user fact or verified live availability.
 
-### Infer routine details; ask only for blockers
+`seats.aero` is an optional, explicitly selected BYO compatibility adapter. Do not select it or load its key by default. Its legacy `search`, `results`, and `trips` commands remain available for an authorized local user; they are not the no-login product source. Future hosted results may use only providers licensed for the applicable production, display, attribution, cache, and anonymous-user use.
 
-- Retain an explicitly supplied airport. For a named metro plus an explicit preferred airport, make that airport primary and use only clearly requested local alternatives (for example, Washington, DC plus IAD preference can become `IAD,DCA,BWI`, disclosed to the user).
-- Resolve a well-known city to its conventional primary airport when that has a low-risk interpretation (for example, Montreal → YUL); disclose it. Ask when the city/metro scope is materially ambiguous.
-- For a US-origin request, interpret `M/D` dates as US-style and resolve a missing year to the next occurrence based on the current date. State the resolved year. Ask if the format or intended year remains materially ambiguous.
-- Treat “back”, “return”, or equivalent language as a reversed second one-way leg. Search outbound and return legs separately instead of rejecting the trip.
-- Default omitted cabin to business for award research (economy for explicit cash-only), passengers to 1, all supported award programs, and connections allowed with known nonstop options preferred. Ask for passenger count only when group/family wording makes a one-person default unsafe. Do not ask up front for programs, stop preference, point cap, or exact nearby-airport preference.
-- Ask one consolidated follow-up only for an unresolved route/date, multi-city/open-jaw itinerary, ambiguous group size, invalid hard constraint, or an API fetch outside airport/date/result bounds.
+## Make the request low-friction; ask only for blockers
 
-## Cache and award search sequence
+- Retain an explicitly supplied airport. For a named metro plus an explicit preferred airport, make that airport primary and use only clearly requested local alternatives; disclose the assumption.
+- Resolve a well-known city to a conventional primary airport only when low risk; disclose it. Ask when metro scope is materially ambiguous.
+- For a US-origin request, interpret `M/D` as US-style and resolve a missing year to the next occurrence; state the resolved year. Ask if format or intended year remains ambiguous.
+- Treat return language as a reversed second one-way leg. Research outbound and return separately.
+- Default omitted cabin to business for award research (economy for explicit cash-only), passengers to one, all programs represented by the selected source, and connections allowed with known nonstop options preferred. Ask for party size only when group/family wording makes one unsafe.
+- Treat every transferable currency or issuer as optional. Do not ask for a transfer source, account balance, or loyalty login up front. Use a public custom transfer profile only when the user asks for transfer math.
+- Ask one consolidated follow-up only for unresolved route/date, multi-city/open-jaw itinerary, ambiguous party size, invalid hard constraint, or a selected provider request outside its documented bounds.
 
-1. Run `research` without `--fetch` first for each leg. It checks exact/compatible completed local searches and reports cache age, freshness, result-cap coverage, and flight-detail coverage.
-2. For an explicit flight-finding request (such as `/research`), a cache miss, stale result, or **partial** cache authorizes one bounded `--fetch` per leg. For ordinary planning-only questions, ask before consuming the API quota:
+## Award-offer imports and ranking
+
+Use `--award-offer` or `--award-offer-file` for a normalized schema-v1 object, list, or `{offers:[...]}`. Prefer inline JSON when practical. File imports are only regular, non-symlink files below project-controlled `imports/` or `examples/` roots, reject `.env`/`.env.*`, and are limited to 1 MB; never point a file flag at an arbitrary local path. Required fields include provider provenance, provider-scoped IDs, redemption program, route/date/cabin, points, fees/tax currency **and per-passenger scope**, availability confidence, detail level, and route-consistent origin/destination/depart/arrival segments for `flight_level`, plus an offset-aware evidence timestamp.
+
+1. Run `research` with the normalized import first. It makes no external request:
 
    ```bash
    ./flight research '{"origin":"SFO","destination":"CDG","departure_date":"2026-09-01"}' \
-     --fetch --max-results 100 --json
+     --award-offer-file imports/award-offers.json --json
    ```
 
-   The MVP permits one bounded Seats.aero cached-search response: no more than three IATA codes on either side, a 14-day departure window, and 100 summaries. It does not use a live award endpoint.
-3. Read `award_search.recommendations_by_program`. Preserve the redemption program/source, cache freshness/coverage, summary-vs-flight detail, tax currency, and unknown-seat status. A current availability response suppresses old trip details, so do not revive them from a prior cache. Do not claim a global cross-program “best” option.
-4. Fetch `trips` only for a small, user-approved shortlist when flight-level details are needed:
+2. Read `award_search.recommendations_by_program`. Preserve provider, redemption program, source mode, manual-import/verification state, cache/freshness if supplied by an adapter, tax currency/scope, and summary-versus-flight detail. Manual-import completeness is unknown/unverified even when a file contains matches; surface its evidence age rather than calling coverage complete.
+3. Keep provider, redemption program, operating carrier, and marketing carrier separate. Do not merge two providers' offers merely because their redemption-program ID matches.
+4. `seats: 0`, `null`, estimated, or unknown inventory means **unknown**, not sold out. Do not promise a seat count that the evidence does not support.
+5. Recommendations are ranked only within a provider/program/tax-currency bucket. Do not claim a global cross-provider, cross-program, or cross-currency winner.
+6. An imported `provider_live_offer` or cached mode is a source assertion. It remains `imported_manually` and `not_independently_verified`; never call it independently verified or guaranteed live inventory.
 
-   ```bash
-   ./flight trips AVAILABILITY_ID --json
-   ```
+If no imported offer is available, report that local no-login research has no award data yet. Offer the manual Google handoff, ask the user to supply a permitted normalized export, or describe the availability of an explicitly authorized provider; never substitute scraping or account login.
+
+## Optional provider fetches
+
+Only an explicitly selected adapter that advertises `supports_fetch` may fetch. For the legacy compatibility path, an explicit flight-finding request and authorization can justify one bounded request:
+
+```bash
+./flight research '{"origin":"SFO","destination":"CDG","departure_date":"2026-09-01"}' \
+  --provider seats.aero --fetch --max-results 100 --json
+```
+
+Do not make live award endpoint calls, broaden a query beyond adapter bounds, or use a provider that has not been selected and authorized. A manual import adapter never fetches or loads credentials. If an optional adapter fails or has incomplete coverage, preserve cached/manual results and report `unavailable` or `partial`; do not silently fall back to another provider.
 
 ## Google Flights and cash comparison
 
-`research` emits `cash_search.url` and `query_text` as a manual browser handoff. The CLI does **not** scrape Google Flights, run a browser, call a Google fare API, or receive live Google fares. Open the URL and confirm the visible search manually.
+`cash_search.url` and `query_text` are a manual Google Flights browser handoff only. Opening the URL sends the displayed trip query to Google. Do **not** scrape Google Flights, automate a browser, call a Google fare API or undocumented endpoint, or claim live Google fares.
 
-A user-observed cash fare can be imported with `--cash-quote` or `--cash-quote-file`; it must include total/per-passenger scope, ISO currency, route, date, cabin, passenger count, `same_itinerary: true`, `fare_inclusions_match: true`, a timezone-aware `observed_at`, and a valid booking/search URL or itinerary evidence before CPP can be calculated. Any CPP is `user_asserted_comparable`, never independently verified; missing evidence remains `not_comparable`.
+A user-observed cash fare can be imported with `--cash-quote` or `--cash-quote-file`. It needs total/per-passenger scope, ISO currency, route, date, cabin, passenger count, `same_itinerary: true`, `fare_inclusions_match: true`, an offset-aware `observed_at`, and a valid booking/search URL or itinerary evidence before CPP can be calculated. Public output strips userinfo, query parameters, and fragments from user-supplied reference URLs. Any CPP is `user_asserted_comparable`, never independently verified; missing evidence or award tax scope remains `not_comparable`.
 
-The report maps only the **selected transfer sources** against the redemption program, not the operating airline. The bundled Chase/Capital One profiles are optional static conveniences; use a custom `transfer_sources` brief field or `--transfer-profile-file` for any other transferable currency. Treat every transfer entry as a static or user-supplied reference requiring source-side verification. Transfers can be irreversible; verify current ratio, minimum, increment, target program, timing, award space, and final fees first. Never put account numbers, balances, personal identifiers, or credentials in a profile file.
-
-## Interpretation rules
-
-- `seats: 0` or `null` means unknown when a source does not reliably report inventory; it is not “sold out.”
-- Prefer `kind: trip` / `detail_level: flight_level` when comparing schedules. Summary rows need confirmation; a fresh availability response intentionally removes stale trip detail.
-- Cached award space can be stale or phantom. Confirm availability and final price on the loyalty-program site before transferring points.
-- Taxes in different currencies are not interchangeable. CPP is shown only for explicitly comparable manual cash evidence; no currency conversion or booking guarantee is implied.
-- Use `./flight stats --json` to monitor local API attempts. Avoid broad pagination and do not invoke unapproved external tools or providers.
+Transfer-source entries are optional static or user-supplied references keyed to a redemption program, never an operating airline. Do not request or expose account numbers, balances, credentials, or personal travel data. Verify transfer rules, award space, and final fees with the source before an irreversible transfer.

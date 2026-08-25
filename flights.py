@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Lightweight Seats.aero award-flight CLI backed by SQLite."""
+"""Dependency-free provider-neutral award-flight research CLI backed by SQLite."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import math
 import os
 import re
 import sqlite3
+import stat
 import sys
 import time
 import urllib.error
@@ -18,10 +19,15 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+import award_providers
 import research as research_core
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_DB = PROJECT_DIR / "data" / "flights.sqlite3"
+# File-based imports are intentionally constrained to project-controlled roots so
+# an AI/controller cannot be tricked into reading arbitrary local files.
+TRUSTED_IMPORT_ROOTS = (PROJECT_DIR / "imports", PROJECT_DIR / "examples")
+MAX_IMPORT_FILE_BYTES = 1_000_000
 BASE_URL = "https://seats.aero/partnerapi"
 CABINS = ("economy", "premium", "business", "first")
 CABIN_FIELDS = {
@@ -1159,6 +1165,7 @@ def output_candidates(candidates: list[dict[str, Any]], args: argparse.Namespace
 
 def _reject_environment_file(path: Path, label: str) -> None:
     """Never treat an environment file (including a symlink) as research input."""
+
     candidates = [path]
     try:
         candidates.append(path.resolve())
@@ -1168,14 +1175,74 @@ def _reject_environment_file(path: Path, label: str) -> None:
         raise FlightError(f"{label} must not be an environment file")
 
 
+def _trusted_import_path(path: Path, label: str) -> Path:
+    """Return a regular, non-symlink file below a project-controlled import root."""
+
+    raw = Path(path)
+    if any(part == ".." for part in raw.parts):
+        raise FlightError(f"{label} must not contain parent-directory traversal")
+    candidate = raw if raw.is_absolute() else PROJECT_DIR / raw
+    candidate = candidate.absolute()
+    for root in TRUSTED_IMPORT_ROOTS:
+        root_path = Path(root).absolute()
+        try:
+            relative = candidate.relative_to(root_path)
+        except ValueError:
+            continue
+        if not relative.parts:
+            raise FlightError(f"{label} must name a regular JSON file below a trusted import root")
+        if root_path.is_symlink():
+            raise FlightError(f"trusted import root for {label} must not be a symlink")
+        component = root_path
+        try:
+            for part in relative.parts:
+                component = component / part
+                if component.is_symlink():
+                    raise FlightError(f"{label} must not be a symlink or pass through a symlink")
+            resolved_root = root_path.resolve(strict=True)
+            resolved = candidate.resolve(strict=True)
+            try:
+                resolved.relative_to(resolved_root)
+            except ValueError as exc:
+                raise FlightError(f"{label} must stay below a trusted import root") from exc
+            metadata = os.lstat(resolved)
+        except FlightError:
+            raise
+        except OSError as exc:
+            raise FlightError(f"could not read {label}: {exc}") from exc
+        if not stat.S_ISREG(metadata.st_mode):
+            raise FlightError(f"{label} must be a regular file")
+        if metadata.st_size > MAX_IMPORT_FILE_BYTES:
+            raise FlightError(f"{label} exceeds the {MAX_IMPORT_FILE_BYTES}-byte import limit")
+        _reject_environment_file(resolved, label)
+        return resolved
+    roots = ", ".join(str(Path(root)) for root in TRUSTED_IMPORT_ROOTS)
+    raise FlightError(f"{label} must be inside a trusted import root ({roots})")
+
+
 def _read_json_file(path: Path, label: str) -> Any:
-    _reject_environment_file(path, label)
+    safe_path = _trusted_import_path(path, label)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor: int | None = None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        descriptor = os.open(safe_path, flags)
+        opened_metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_metadata.st_mode):
+            raise FlightError(f"{label} must be a regular file")
+        if opened_metadata.st_size > MAX_IMPORT_FILE_BYTES:
+            raise FlightError(f"{label} exceeds the {MAX_IMPORT_FILE_BYTES}-byte import limit")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = None
+            return json.load(handle)
+    except FlightError:
+        raise
     except OSError as exc:
         raise FlightError(f"could not read {label}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise FlightError(f"{label} must contain valid JSON") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _research_brief_input(args: argparse.Namespace) -> str | dict[str, Any]:
@@ -1236,29 +1303,64 @@ def _transfer_profile_inputs(args: argparse.Namespace) -> tuple[list[Any], list[
 
 
 def _research_fetch_args(brief: research_core.ResearchBrief, args: argparse.Namespace) -> argparse.Namespace:
-    """Adapt a validated brief to the existing Seats.aero search implementation."""
+    """Compatibility wrapper for the explicit legacy Seats.aero adapter."""
+
+    request = award_providers.AwardSearchRequest(
+        origins=brief.origins,
+        destinations=brief.destinations,
+        start_date=brief.start_date or "",
+        end_date=brief.end_date or "",
+        cabin=brief.cabin,
+        passengers=brief.passengers,
+        program_ids=brief.programs,
+        direct_only=brief.direct_only,
+        max_points=brief.max_points,
+        result_limit=args.max_results,
+        cache_ttl_hours=args.cache_ttl_hours,
+    )
+    return _seats_fetch_args(request, args)
+
+
+def _seats_fetch_args(
+    request: award_providers.AwardSearchRequest, args: argparse.Namespace
+) -> argparse.Namespace:
+    """Adapt a provider-neutral request to the legacy optional compatibility API."""
+
     return argparse.Namespace(
-        origins=",".join(brief.origins),
-        destinations=",".join(brief.destinations),
-        start_date=brief.start_date,
-        end_date=brief.end_date,
-        cabins=brief.cabin,
-        sources=brief.sources,
+        origins=",".join(request.origins),
+        destinations=",".join(request.destinations),
+        start_date=request.start_date,
+        end_date=request.end_date,
+        cabins=request.cabin,
+        sources=",".join(request.program_ids),
         carriers="",
-        direct=brief.direct_only,
-        seats=brief.passengers,
+        direct=request.direct_only,
+        seats=request.passengers,
         summary_only=False,
-        max_results=args.max_results,
+        max_results=request.result_limit,
         timeout=args.timeout,
         single_page=True,
     )
 
 
-def _research_request_summary(brief: research_core.ResearchBrief, args: argparse.Namespace) -> dict[str, Any]:
+def _research_request_summary(
+    brief: research_core.ResearchBrief,
+    args: argparse.Namespace,
+    provider: award_providers.AwardProvider,
+) -> dict[str, Any]:
+    """Describe a selected adapter without claiming an unperformed live search."""
+
     unresolved = lambda field: brief.provenance.get(field) == "unresolved"
+    limits = provider.limits
+    endpoint = (
+        "local normalized award-offer import"
+        if not limits.network_access
+        else "adapter-managed provider search"
+    )
     return {
-        "provider": "seats.aero",
-        "endpoint": "/search (cached availability)",
+        "provider": provider.id,
+        "provider_name": provider.display_name,
+        "endpoint": endpoint,
         "origins": list(brief.origins),
         "destinations": list(brief.destinations),
         "start_date": brief.start_date,
@@ -1266,12 +1368,22 @@ def _research_request_summary(brief: research_core.ResearchBrief, args: argparse
         "cabin": None if unresolved("cabin") else brief.cabin,
         "passengers": None if unresolved("passengers") else brief.passengers,
         "programs": "unresolved" if unresolved("programs") else (
-            list(brief.programs) if brief.programs else "all_supported"
+            list(brief.programs) if brief.programs else "all_supported_by_selected_source"
         ),
         "direct_only": None if unresolved("stops") else brief.direct_only,
         "max_results": args.max_results,
-        "one_logical_request": True,
+        "one_logical_request": bool(limits.supports_fetch),
         "live_award_search": False,
+        "provider_capabilities": {
+            "supports_fetch": limits.supports_fetch,
+            "requires_credentials": limits.requires_credentials,
+            "network_access": limits.network_access,
+            "requires_explicit_selection": limits.requires_explicit_selection,
+            "max_airports_per_side": limits.max_airports_per_side,
+            "max_date_span_days": limits.max_date_span_days,
+            "max_results": limits.max_results,
+            "strict_program_catalog": limits.strict_program_catalog,
+        },
     }
 
 
@@ -1299,6 +1411,7 @@ def _cache_summary(
 
 def _unique_research_issues(issues: Iterable[dict[str, str]]) -> list[dict[str, str]]:
     """Keep a concise, stable set of action fields in the AI-facing report."""
+
     result: list[dict[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for issue in issues:
@@ -1314,8 +1427,8 @@ def _unique_research_issues(issues: Iterable[dict[str, str]]) -> list[dict[str, 
 def _research_ranked_candidates(
     db: Database, search_id: int, brief: research_core.ResearchBrief
 ) -> list[dict[str, Any]]:
-    # The research renderer groups by program/currency afterwards.  This call only
-    # applies the user's cabin, seat, direct, point-cap, and source filters.
+    """Legacy helper retained for callers of the direct Seats.aero cache path."""
+
     return rank_candidates(
         db.candidates(search_id=search_id),
         cabins=brief.cabin,
@@ -1327,26 +1440,330 @@ def _research_ranked_candidates(
     )
 
 
+def _rank_normalized_offers(
+    offers: Iterable[award_providers.AwardOffer], brief: research_core.ResearchBrief
+) -> list[dict[str, Any]]:
+    """The one shared ranking boundary for every provider adapter."""
+
+    return rank_candidates(
+        (offer.to_candidate() for offer in offers),
+        cabins=brief.cabin,
+        seats=brief.passengers,
+        direct=brief.direct_only,
+        max_points=brief.max_points,
+        programs=brief.sources,
+        sort="points",
+    )
+
+
+class SeatsAeroResearchAdapter:
+    """Explicit optional bridge from legacy Seats.aero storage to normalized offers.
+
+    New adapters must implement ``AwardProvider`` directly and must not read the
+    legacy Seat-shaped SQLite tables.  This adapter is the only compatibility path
+    allowed to use them.
+    """
+
+    id = "seats.aero"
+    display_name = "Seats.aero (bring your own eligible key)"
+    program_catalog = PROGRAMS
+    limits = award_providers.ProviderLimits(
+        supports_fetch=True,
+        requires_credentials=True,
+        network_access=True,
+        requires_explicit_selection=True,
+        max_airports_per_side=research_core.MAX_AIRPORTS_PER_SIDE,
+        max_date_span_days=research_core.MAX_FETCH_DATE_SPAN_DAYS,
+        max_results=research_core.MAX_FETCH_RESULTS,
+        strict_program_catalog=True,
+        description=(
+            "Optional local compatibility adapter. Cached reads use local legacy data; "
+            "an explicit --fetch uses the user's eligible local key."
+        ),
+    )
+
+    def __init__(
+        self,
+        db: Database,
+        args: argparse.Namespace,
+        *,
+        fetcher: Callable[[Database, argparse.Namespace], tuple[int, int, list[dict[str, Any]]]],
+        prepare_api: Callable[[], None] | None,
+    ):
+        self.db = db
+        self.args = args
+        self._fetcher = fetcher
+        self._prepare_api = prepare_api
+
+    def _offers_for_search(self, search_id: int) -> tuple[award_providers.AwardOffer, ...]:
+        offers: list[award_providers.AwardOffer] = []
+        for candidate in self.db.candidates(search_id=search_id):
+            program = str(candidate.get("program") or "").lower()
+            offers.append(award_providers.legacy_candidate_to_award_offer(
+                candidate,
+                provider_id=self.id,
+                provider_name="Seats.aero",
+                program_name=PROGRAMS.get(program, program or "Unknown redemption program"),
+            ))
+        return tuple(offers)
+
+    def find_cached(
+        self, request: award_providers.AwardSearchRequest
+    ) -> award_providers.AwardSearchSnapshot:
+        lookup = {
+            "origins": ",".join(request.origins),
+            "destinations": ",".join(request.destinations),
+            "start_date": request.start_date,
+            "end_date": request.end_date,
+            "cabins": request.cabin,
+            "sources": ",".join(request.program_ids),
+            "carriers": "",
+            "direct": request.direct_only,
+        }
+        cache = self.db.find_matching_search(**lookup, required_result_limit=request.result_limit)
+        if cache is None:
+            cache = self.db.find_compatible_search(**lookup, required_result_limit=request.result_limit)
+        coverage = self.db.search_coverage(int(cache["id"])) if cache else None
+        cache_summary = _cache_summary(cache, request.cache_ttl_hours, coverage)
+        offers: tuple[award_providers.AwardOffer, ...] = ()
+        if cache:
+            offers = self._offers_for_search(int(cache["id"]))
+        cache_is_fresh = bool(cache_summary and cache_summary["fresh"])
+        cache_may_be_truncated = bool(coverage and coverage["may_be_truncated"])
+        cache_summary_only = bool(coverage and not coverage["trip_details_requested"])
+        can_suppress_fetch = bool(
+            cache
+            and cache_is_fresh
+            and cache.get("cache_match") == "exact"
+            and not cache_may_be_truncated
+            and not cache_summary_only
+        )
+        if cache is None:
+            status = "cache_miss"
+        elif can_suppress_fetch:
+            status = "cache_hit"
+        elif cache_is_fresh:
+            status = "cache_partial"
+        else:
+            status = "cache_stale"
+        return award_providers.AwardSearchSnapshot(
+            provider_id=self.id,
+            provider_name=self.display_name,
+            offers=offers,
+            status=status,
+            coverage=coverage or {},
+            cache=cache_summary,
+            can_suppress_fetch=can_suppress_fetch,
+            fetch_supported=True,
+        )
+
+    def fetch(
+        self, request: award_providers.AwardSearchRequest
+    ) -> award_providers.AwardSearchSnapshot:
+        if self._prepare_api is not None:
+            self._prepare_api()
+        search_id, count, _ = self._fetcher(self.db, _seats_fetch_args(request, self.args))
+        stored_row = self.db.search_row(search_id)
+        if stored_row is not None:
+            fetched_cache = Database._cache_row_with_age(stored_row, max_age_seconds=None)
+            fetched_cache["cache_match"] = "fresh_fetch"
+            coverage = self.db.search_coverage(search_id) or {}
+            cache_summary = _cache_summary(fetched_cache, request.cache_ttl_hours, coverage)
+            offers = self._offers_for_search(search_id)
+        else:
+            # Test/dry adapters can return a search id without storing it. Do not
+            # claim exhaustive coverage or provider verification in that case.
+            coverage = {
+                "requested_limit": request.result_limit,
+                "stored_result_count": count,
+                "provider_has_more": None,
+                "result_cap_reached": count >= request.result_limit,
+                "may_be_truncated": count >= request.result_limit,
+                "trip_details_requested": True,
+                "flight_level_availability_count": None,
+                "summary_only_availability_count": None,
+            }
+            cache_summary = {
+                "search_id": search_id,
+                "match": "fresh_fetch",
+                "age_seconds": 0,
+                "ttl_hours": request.cache_ttl_hours,
+                "fresh": True,
+                "result_count": count,
+                "coverage": coverage,
+            }
+            offers = ()
+        partial = bool(coverage.get("may_be_truncated") or not coverage.get("trip_details_requested"))
+        return award_providers.AwardSearchSnapshot(
+            provider_id=self.id,
+            provider_name=self.display_name,
+            offers=offers,
+            status="fetched_partial" if partial else "fetched",
+            coverage=coverage,
+            cache=cache_summary,
+            can_suppress_fetch=not partial,
+            fetch_supported=True,
+            note=(
+                "The bounded response may be result-limited or lack flight-level detail; "
+                "narrow the brief or verify a shortlist before transferring points."
+                if partial else None
+            ),
+        )
+
+
+def _award_offer_inputs(args: argparse.Namespace) -> tuple[list[Any], list[dict[str, str]]]:
+    """Read public normalized offer imports while rejecting environment-file paths."""
+
+    payloads: list[Any] = []
+    issues: list[dict[str, str]] = []
+    for raw in getattr(args, "award_offer", []):
+        try:
+            payloads.append(json.loads(raw))
+        except json.JSONDecodeError:
+            issues.append({
+                "field": "award_offer",
+                "reason": "--award-offer must be valid normalized offer JSON; use --award-offer-file for a JSON file.",
+            })
+    for path in getattr(args, "award_offer_file", []):
+        try:
+            payloads.append(_read_json_file(path, "award-offer file"))
+        except FlightError as exc:
+            issues.append({"field": "award_offer", "reason": str(exc)})
+    return payloads, issues
+
+
+def build_research_provider_registry(
+    db: Database | None,
+    args: argparse.Namespace,
+    *,
+    manual_offers: Iterable[award_providers.AwardOffer] = (),
+    fetcher: Callable[[Database, argparse.Namespace], tuple[int, int, list[dict[str, Any]]]] | None = None,
+    prepare_api: Callable[[], None] | None = None,
+) -> award_providers.ProviderRegistry:
+    """Register local imports and only construct legacy storage adapters when needed."""
+
+    providers: list[award_providers.AwardProvider] = [
+        award_providers.ManualAwardImportProvider(tuple(manual_offers))
+    ]
+    if db is not None:
+        providers.append(SeatsAeroResearchAdapter(
+            db,
+            args,
+            fetcher=fetcher or fetch_search,
+            prepare_api=prepare_api,
+        ))
+    return award_providers.ProviderRegistry(tuple(providers))
+
+
+def provider_manifest() -> list[dict[str, Any]]:
+    """Public capability manifest; it does not open a database or load credentials."""
+
+    manual = award_providers.ManualAwardImportProvider()
+    seats = SeatsAeroResearchAdapter
+    manifest = award_providers.ProviderRegistry((manual,)).manifest()
+    manifest.append({
+        "id": seats.id,
+        "name": seats.display_name,
+        "program_catalog_size": len(seats.program_catalog),
+        "supports_fetch": seats.limits.supports_fetch,
+        "requires_credentials": seats.limits.requires_credentials,
+        "network_access": seats.limits.network_access,
+        "requires_explicit_selection": seats.limits.requires_explicit_selection,
+        "max_airports_per_side": seats.limits.max_airports_per_side,
+        "max_date_span_days": seats.limits.max_date_span_days,
+        "max_results": seats.limits.max_results,
+        "strict_program_catalog": seats.limits.strict_program_catalog,
+        "description": seats.limits.description,
+    })
+    manifest.extend([
+        {
+            "id": "google_flights_handoff",
+            "name": "Google Flights manual browser handoff",
+            "program_catalog_size": 0,
+            "supports_fetch": False,
+            "requires_credentials": False,
+            "network_access": False,
+            "requires_explicit_selection": False,
+            "max_airports_per_side": None,
+            "max_date_span_days": None,
+            "max_results": None,
+            "strict_program_catalog": False,
+            "description": "Manual browser handoff only; no scraping, browser automation, or fare-data ingestion.",
+        },
+        {
+            "id": "manual_cash_import",
+            "name": "Manual cash quote import",
+            "program_catalog_size": 0,
+            "supports_fetch": False,
+            "requires_credentials": False,
+            "network_access": False,
+            "requires_explicit_selection": False,
+            "max_airports_per_side": None,
+            "max_date_span_days": None,
+            "max_results": None,
+            "strict_program_catalog": False,
+            "description": "User-asserted cash observations only; never represented as a Google fare API result.",
+        },
+    ])
+    return manifest
+
+
 def run_research(
-    db: Database,
+    db: Database | None,
     args: argparse.Namespace,
     *,
     fetcher: Callable[[Database, argparse.Namespace], tuple[int, int, list[dict[str, Any]]]] | None = None,
     prepare_api: Callable[[], None] | None = None,
+    provider_registry: award_providers.ProviderRegistry | None = None,
 ) -> dict[str, Any]:
-    """Execute a cache-first research run without ever querying Google Flights.
+    """Run one selected provider adapter without ever querying Google Flights.
 
-    ``--fetch`` is explicit.  It can make one bounded Seats.aero cached-search request
-    after all brief/fetch guardrails pass; a fresh exact cache suppresses that request.
+    The default adapter is a local normalized award-offer import and therefore needs
+    neither a provider account nor a key.  Seats.aero remains available only when a
+    caller explicitly selects ``--provider seats.aero``.
     """
-    if fetcher is None:
-        fetcher = fetch_search
+
+    award_payloads, award_input_issues = _award_offer_inputs(args)
+    manual_offers, award_validation_issues = award_providers.parse_award_offers(award_payloads)
+    award_import_issues = [*award_input_issues, *award_validation_issues]
+    if provider_registry is None:
+        registry = build_research_provider_registry(
+            db,
+            args,
+            manual_offers=manual_offers,
+            fetcher=fetcher,
+            prepare_api=prepare_api,
+        )
+    else:
+        registry = provider_registry
+    try:
+        provider = registry.get(getattr(args, "provider", "manual_import"))
+    except award_providers.ProviderError as exc:
+        raise FlightError(str(exc)) from exc
+    if provider.id != award_providers.ManualAwardImportProvider.id and manual_offers:
+        award_import_issues.append({
+            "field": "award_offer",
+            "reason": "--award-offer imports use --provider manual_import; provider adapters are selected one at a time.",
+        })
+
     raw_brief = _research_brief_input(args)
-    brief = research_core.parse_trip_brief(raw_brief, PROGRAMS)
+    program_catalog = dict(provider.program_catalog)
+    # Imported offers carry their own canonical program names; use those names only
+    # on the local import adapter so one selected provider cannot alter another
+    # adapter's program filters.
+    if provider.id == award_providers.ManualAwardImportProvider.id:
+        for offer in manual_offers:
+            program_catalog.setdefault(offer.program_id, offer.program_name)
+    brief = research_core.parse_trip_brief(
+        raw_brief,
+        program_catalog,
+        allow_unknown_program_ids=not provider.limits.strict_program_catalog,
+    )
+
     transfer_payloads, transfer_profile_issues = _transfer_profile_inputs(args)
     parsed_transfer_groups: list[tuple[research_core.TransferProfile, ...]] = []
     for payload in transfer_payloads:
-        profiles, profile_error = research_core.parse_transfer_profiles(payload, PROGRAMS)
+        profiles, profile_error = research_core.parse_transfer_profiles(payload, program_catalog)
         if profile_error or profiles is None:
             transfer_profile_issues.append({
                 "field": "transfer_sources",
@@ -1366,165 +1783,149 @@ def run_research(
         else:
             brief.transfer_profiles = combined_profiles
             brief.provenance["transfer_sources"] = "user"
+
     cash_payloads, cash_input_issues = _cash_quote_inputs(args)
     cash_quotes, cash_quote_issues = research_core.parse_manual_cash_quotes(cash_payloads)
     cash_quote_issues = cash_input_issues + cash_quote_issues
-    fetch_issues = brief.fetch_follow_ups(args.max_results)
-    request = _research_request_summary(brief, args)
+    fetch_issues = (
+        brief.fetch_follow_ups(
+            args.max_results,
+            max_airports_per_side=provider.limits.max_airports_per_side,
+            max_date_span_days=provider.limits.max_date_span_days,
+            provider_max_results=provider.limits.max_results,
+        )
+        if provider.limits.supports_fetch else []
+    )
+    request = _research_request_summary(brief, args, provider)
     award: dict[str, Any] = {
-        "provider": "seats.aero",
-        "provider_mode": "cached_award_availability",
+        "provider": provider.id,
+        "provider_name": provider.display_name,
+        "provider_mode": "adapter_selected",
         "request": request,
         "status": "not_started",
         "cache": None,
+        "coverage": None,
         "candidate_count": 0,
         "recommendations_by_program": [],
+        "provenance": {
+            "selected_adapter": provider.id,
+            "requires_explicit_selection": provider.limits.requires_explicit_selection,
+            "credentials_required_for_fetch": provider.limits.requires_credentials,
+            "network_access": provider.limits.network_access,
+            "network_used": False,
+        },
     }
     candidates: list[dict[str, Any]] = []
     fetch_blocked = False
 
     if brief.follow_up_fields:
         award["status"] = "needs_clarification"
-        if args.fetch:
+        if args.fetch and provider.limits.supports_fetch:
             fetch_blocked = True
             award["fetch"] = {"status": "blocked", "follow_up_fields": fetch_issues}
     elif brief.intent == "cash_only":
         award["status"] = "skipped_cash_only"
     else:
-        lookup = {
-            "origins": ",".join(brief.origins),
-            "destinations": ",".join(brief.destinations),
-            "start_date": brief.start_date or "",
-            "end_date": brief.end_date or "",
-            "cabins": brief.cabin,
-            "sources": brief.sources,
-            "carriers": "",
-            "direct": brief.direct_only,
-        }
-        cache = db.find_matching_search(**lookup, required_result_limit=args.max_results)
-        if cache is None:
-            cache = db.find_compatible_search(**lookup, required_result_limit=args.max_results)
-        cache_coverage = db.search_coverage(int(cache["id"])) if cache else None
-        cache_summary = _cache_summary(cache, args.cache_ttl_hours, cache_coverage)
-        award["cache"] = cache_summary
-        cache_is_fresh = bool(cache_summary and cache_summary["fresh"])
-        cache_may_be_truncated = bool(cache_coverage and cache_coverage["may_be_truncated"])
-        cache_summary_only = bool(cache_coverage and not cache_coverage["trip_details_requested"])
-        cache_can_suppress_fetch = bool(
-            cache
-            and cache_is_fresh
-            and cache.get("cache_match") == "exact"
-            and not cache_may_be_truncated
-            and not cache_summary_only
-        )
-        cached_candidates: list[dict[str, Any]] = []
-        if cache:
-            cached_candidates = _research_ranked_candidates(db, int(cache["id"]), brief)
-            candidates = cached_candidates
-            if cache_can_suppress_fetch:
-                award["status"] = "cache_hit"
-            elif cache_is_fresh:
-                award["status"] = "cache_partial"
-            else:
-                award["status"] = "cache_stale"
-        else:
-            award["status"] = "cache_miss"
+        try:
+            snapshot = provider.find_cached(award_providers.AwardSearchRequest(
+                origins=brief.origins,
+                destinations=brief.destinations,
+                start_date=brief.start_date or "",
+                end_date=brief.end_date or "",
+                cabin=brief.cabin,
+                passengers=brief.passengers,
+                program_ids=brief.programs,
+                direct_only=brief.direct_only,
+                max_points=brief.max_points,
+                result_limit=args.max_results,
+                cache_ttl_hours=args.cache_ttl_hours,
+            ))
+        except award_providers.ProviderError as exc:
+            snapshot = award_providers.AwardSearchSnapshot(
+                provider_id=provider.id,
+                provider_name=provider.display_name,
+                status="provider_unavailable",
+                note=str(exc),
+                fetch_supported=provider.limits.supports_fetch,
+            )
+        candidates = _rank_normalized_offers(snapshot.offers, brief)
+        award.update({
+            "status": snapshot.status,
+            "cache": dict(snapshot.cache) if snapshot.cache is not None else None,
+            "coverage": dict(snapshot.coverage),
+            "candidate_count": len(candidates),
+        })
+        if snapshot.note:
+            award["note"] = snapshot.note
 
-        should_fetch = args.fetch and not cache_can_suppress_fetch
-        if should_fetch and fetch_issues:
-            fetch_blocked = True
-            award["fetch"] = {"status": "blocked", "follow_up_fields": fetch_issues}
-        elif should_fetch:
-            try:
-                if prepare_api is not None:
-                    prepare_api()
-                fetched_args = _research_fetch_args(brief, args)
-                search_id, count, _ = fetcher(db, fetched_args)
-                candidates = _research_ranked_candidates(db, search_id, brief)
-                stored_row = db.search_row(search_id)
-                if stored_row is not None:
-                    fetched_cache = Database._cache_row_with_age(
-                        stored_row, max_age_seconds=None
+        if args.fetch and provider.limits.supports_fetch and not snapshot.can_suppress_fetch:
+            if fetch_issues:
+                fetch_blocked = True
+                award["fetch"] = {"status": "blocked", "follow_up_fields": fetch_issues}
+            else:
+                try:
+                    fetched_snapshot = provider.fetch(award_providers.AwardSearchRequest(
+                        origins=brief.origins,
+                        destinations=brief.destinations,
+                        start_date=brief.start_date or "",
+                        end_date=brief.end_date or "",
+                        cabin=brief.cabin,
+                        passengers=brief.passengers,
+                        program_ids=brief.programs,
+                        direct_only=brief.direct_only,
+                        max_points=brief.max_points,
+                        result_limit=args.max_results,
+                        cache_ttl_hours=args.cache_ttl_hours,
+                    ))
+                    candidates = _rank_normalized_offers(fetched_snapshot.offers, brief)
+                    award.update({
+                        "status": fetched_snapshot.status,
+                        "cache": dict(fetched_snapshot.cache) if fetched_snapshot.cache is not None else None,
+                        "coverage": dict(fetched_snapshot.coverage),
+                        "candidate_count": len(candidates),
+                        "fetch": {
+                            "status": "completed",
+                            "search_id": (fetched_snapshot.cache or {}).get("search_id"),
+                            "availability_count": (fetched_snapshot.cache or {}).get("result_count"),
+                            "coverage": dict(fetched_snapshot.coverage),
+                        },
+                    })
+                    award["provenance"]["network_used"] = bool(
+                        fetched_snapshot.coverage.get("network_used", provider.limits.network_access)
                     )
-                    fetched_cache["cache_match"] = "fresh_fetch"
-                    fetched_coverage = db.search_coverage(search_id)
-                    fetched_summary = _cache_summary(
-                        fetched_cache, args.cache_ttl_hours, fetched_coverage
-                    )
-                else:
-                    # Test/dry adapters can return a search id without storing it.
-                    # Keep the report conservative rather than assuming full coverage.
-                    fetched_coverage = {
-                        "requested_limit": args.max_results,
-                        "stored_result_count": count,
-                        "provider_has_more": None,
-                        "result_cap_reached": count >= args.max_results,
-                        "may_be_truncated": count >= args.max_results,
-                        "trip_details_requested": True,
-                        "flight_level_availability_count": None,
-                        "summary_only_availability_count": None,
-                    }
-                    fetched_summary = {
-                        "search_id": search_id,
-                        "match": "fresh_fetch",
-                        "age_seconds": 0,
-                        "ttl_hours": args.cache_ttl_hours,
-                        "fresh": True,
-                        "result_count": count,
-                        "coverage": fetched_coverage,
-                    }
-                fetched_is_partial = bool(
-                    fetched_coverage
-                    and (
-                        fetched_coverage["may_be_truncated"]
-                        or not fetched_coverage["trip_details_requested"]
-                    )
-                )
-                award.update({
-                    "status": "fetched_partial" if fetched_is_partial else "fetched",
-                    "cache": fetched_summary,
-                    "fetch": {
-                        "status": "completed",
-                        "search_id": search_id,
-                        "availability_count": count,
-                        "coverage": fetched_coverage,
-                    },
-                })
-                if fetched_is_partial:
-                    award["fetch"]["note"] = (
-                        "The bounded response may be result-limited or lack flight-level detail; "
-                        "narrow the brief or verify a shortlist before transferring points."
-                    )
-            except FlightError as exc:
-                # Do not surface an upstream response body in an AI-facing report.
-                # It is enough to identify the failed provider/status and preserve the
-                # cache/manual handoff path.
-                status = getattr(exc, "status", None)
-                error = "Seats.aero cached search failed"
-                if status is not None:
-                    error += f" (HTTP {status})"
-                award.update({
-                    "status": "fetch_failed_using_cache" if cached_candidates else "fetch_failed",
-                    "fetch": {
-                        "status": "failed",
-                        "error": error + ".",
-                        "note": "Google Flights handoff and any local cached results remain available; no live fare is claimed.",
-                    },
-                })
-                candidates = cached_candidates
-        elif args.fetch and cache_can_suppress_fetch:
+                    if fetched_snapshot.note:
+                        award["fetch"]["note"] = fetched_snapshot.note
+                except (FlightError, award_providers.ProviderError) as exc:
+                    status = getattr(exc, "status", None)
+                    error = f"{provider.display_name} search failed"
+                    if status is not None:
+                        error += f" (HTTP {status})"
+                    award.update({
+                        "status": "fetch_failed_using_cache" if candidates else "fetch_failed",
+                        "fetch": {
+                            "status": "failed",
+                            "error": error + ".",
+                            "note": "Any local results and the manual Google Flights handoff remain available; no live fare is claimed.",
+                        },
+                    })
+        elif args.fetch and provider.limits.supports_fetch and snapshot.can_suppress_fetch:
             award["fetch"] = {"status": "skipped_fresh_exact_cache"}
-        elif not args.fetch and cache is None:
-            award["next_action"] = "No compatible local award cache was found. Re-run with --fetch to make one bounded Seats.aero cached-search request."
-        elif not args.fetch and cache and (cache_may_be_truncated or cache_summary_only):
-            reasons = []
-            if cache_may_be_truncated:
-                reasons.append("the stored result cap may have truncated options")
-            if cache_summary_only:
-                reasons.append("the stored search omitted embedded trip details")
+        elif args.fetch and not provider.limits.supports_fetch:
+            award["fetch"] = {
+                "status": "not_supported",
+                "note": "This local import adapter never fetches or loads credentials. Supply normalized --award-offer data or select an explicitly authorized provider adapter.",
+            }
+        elif not args.fetch and provider.id == award_providers.ManualAwardImportProvider.id and not snapshot.offers:
+            award["next_action"] = "Supply a normalized --award-offer or --award-offer-file for local no-login ranking."
+        elif not args.fetch and provider.limits.supports_fetch and snapshot.status == "cache_miss":
             award["next_action"] = (
-                "Local cached results are partial because " + " and ".join(reasons)
-                + ". Re-run with --fetch to make one bounded Seats.aero cached-search request."
+                f"No compatible local cache was found for {provider.display_name}. "
+                f"Re-run with --provider {provider.id} --fetch only if you are authorized to use that provider."
+            )
+        elif not args.fetch and snapshot.status == "cache_partial":
+            award["next_action"] = (
+                "The selected provider's local cache is partial. An explicit authorized provider refresh may be available; "
+                "do not treat partial cached coverage as exhaustive."
             )
 
     if brief.intent == "award_only":
@@ -1540,22 +1941,25 @@ def run_research(
         cash_handoff["manual_import_schema"] = research_core.manual_cash_quote_schema()
 
     groups = research_core.group_award_recommendations(
-        candidates, brief, PROGRAMS, cash_quotes, args.limit, brief.transfer_profiles
+        candidates, brief, program_catalog, cash_quotes, args.limit, brief.transfer_profiles
     )
     award["candidate_count"] = len(candidates)
     award["recommendations_by_program"] = groups
     comparison = research_core.comparison_summary(groups)
     transfer_profile_issues = _unique_research_issues(transfer_profile_issues)
+    award_import_issues = _unique_research_issues(award_import_issues)
     report_follow_ups = _unique_research_issues(
         [*brief.follow_up_fields, *transfer_profile_issues, *(fetch_issues if fetch_blocked else [])]
     )
     report_status = "needs_clarification" if report_follow_ups else "ready"
     if not report_follow_ups and (
         award["status"] in {
-            "cache_partial", "fetch_failed", "fetch_failed_using_cache", "fetched_partial"
+            "cache_partial", "fetch_failed", "fetch_failed_using_cache", "fetched_partial",
+            "provider_unavailable", "unavailable", "not_covered", "partial",
         }
         or cash_quote_issues
         or transfer_profile_issues
+        or award_import_issues
     ):
         report_status = "partial"
     report = {
@@ -1563,6 +1967,14 @@ def run_research(
         "brief": brief.to_dict(),
         "follow_up_fields": report_follow_ups,
         "award_search": award,
+        "award_imports": {
+            "mode": "manual_normalized_import",
+            "schema_version": award_providers.AWARD_OFFER_SCHEMA_VERSION,
+            "schema": award_providers.award_offer_schema(),
+            "accepted_count": len(manual_offers),
+            "issues": award_import_issues,
+            "note": "Imported offers retain stated provider provenance but are user-supplied and not independently verified by Flight Finder.",
+        },
         "cash_search": cash_handoff,
         "cash_quotes": {
             "mode": "manual_import_only",
@@ -1580,11 +1992,12 @@ def run_research(
         },
         "comparison": comparison,
         "limitations": [
-            "Seats.aero results are cached award availability, not a live-inventory guarantee; cache coverage can be result-limited or summary-only.",
+            "Award results identify their selected adapter and per-offer provenance; imported records are not independently verified or a live-availability guarantee.",
             "This command does not scrape Google Flights and does not obtain live Google fares.",
             "Manual cash CPP is user-asserted evidence, not independently verified fare data.",
-            "No cross-program or cross-currency global winner is calculated.",
-            "Transfers are source-side and can be irreversible; verify current partner eligibility, ratio, timing, award space, and final fees before moving points."
+            "No cross-provider, cross-program, or cross-currency global winner is calculated.",
+            "A hosted product must use providers licensed for its production, display, attribution, cache, and anonymous no-login use; it must report unavailable or partial coverage rather than silently falling back to an unlicensed source.",
+            "Transfers are source-side and can be irreversible; verify current partner eligibility, ratio, timing, award space, and final fees before moving points.",
         ],
     }
     return report
@@ -1631,7 +2044,8 @@ def research_text(report: dict[str, Any], markdown: bool = False) -> str:
 
     award = report["award_search"]
     cache = award.get("cache")
-    lines.append(f"\nSeats.aero: {award['status'].replace('_', ' ')}")
+    provider_label = award.get("provider_name") or award.get("provider") or "Award source"
+    lines.append(f"\n{provider_label}: {award['status'].replace('_', ' ')}")
     if cache:
         age = cache.get("age_seconds")
         age_text = "unknown age" if age is None else f"{age}s old"
@@ -1649,18 +2063,34 @@ def research_text(report: dict[str, Any], markdown: bool = False) -> str:
                 f"Coverage: {coverage.get('stored_result_count')} stored (requested cap {coverage.get('requested_limit')}); "
                 f"{cap_text}; {detail_text}."
             )
+    else:
+        coverage = award.get("coverage") or {}
+        if coverage.get("mode") == "manual_import":
+            newest = coverage.get("newest_evidence_at") or "unknown evidence time"
+            age = coverage.get("newest_evidence_age_seconds")
+            age_text = "unknown age" if age is None else f"{age}s old"
+            lines.append(
+                "Import coverage: unknown/unverified (a local import can be incomplete); "
+                f"{coverage.get('stored_result_count', 0)} matching record(s), newest evidence {newest} ({age_text})."
+            )
+    if award.get("note"):
+        lines.append(str(award["note"]))
     if award.get("next_action"):
         lines.append(award["next_action"])
     fetch = award.get("fetch")
     if fetch and fetch.get("status") == "blocked":
         lines.append("Fetch is blocked until: " + "; ".join(issue["field"] for issue in fetch["follow_up_fields"]))
     elif fetch and fetch.get("status") == "failed":
-        lines.append("Seats.aero fetch failed; cached results, if any, are shown below.")
+        lines.append(f"{provider_label} fetch failed; cached results, if any, are shown below.")
     elif fetch and fetch.get("note"):
         lines.append(str(fetch["note"]))
 
     for group in award.get("recommendations_by_program", []):
-        heading = f"## {group['program_name']}" if markdown else f"\n{group['program_name']} ({group['program']})"
+        group_source = group.get("provider_name") or group.get("provider") or "Unknown provider"
+        heading = (
+            f"## {group_source} — {group['program_name']}"
+            if markdown else f"\n{group_source} — {group['program_name']} ({group['program']})"
+        )
         lines.append("\n" + heading if markdown else heading)
         for bucket in group.get("tax_currency_buckets", []):
             currency = bucket["tax_currency"] or "tax currency unknown"
@@ -1668,10 +2098,17 @@ def research_text(report: dict[str, Any], markdown: bool = False) -> str:
             for item in bucket.get("recommendations", []):
                 seat_text = item["seats"] if item.get("seats") not in (None, 0) else "unknown"
                 stops = item["stops"] if item.get("stops") is not None else "unknown"
+                evidence = item["research_evidence"]
+                provenance_suffix = ""
+                if evidence.get("imported_manually"):
+                    provenance_suffix = (
+                        f" Source state: {evidence.get('provider_mode', 'unknown')} "
+                        f"({evidence.get('verification_status', 'not independently verified')})."
+                    )
                 lines.append(
                     f"- {item.get('date')} {item.get('origin')}-{item.get('destination')}: "
                     f"{format_points(item.get('points'))} points, {format_taxes(item)}, seats {seat_text}, stops {stops} "
-                    f"({item['research_evidence']['detail_level']})."
+                    f"({evidence['detail_level']}).{provenance_suffix}"
                 )
                 for transfer in item.get("transfer_access", []):
                     if transfer.get("status") == "direct_reference" and transfer.get("source_points_to_transfer"):
@@ -1709,7 +2146,11 @@ def research_text(report: dict[str, Any], markdown: bool = False) -> str:
     handoff = report["cash_search"]
     lines.append(f"\nGoogle Flights: {handoff['status'].replace('_', ' ')} (manual handoff; no scraping or live fare retrieval).")
     if handoff.get("url"):
+        lines.append("Opening this URL shares the displayed trip query with Google.")
         lines.append(handoff["url"])
+    award_import_issues = report.get("award_imports", {}).get("issues", [])
+    if award_import_issues:
+        lines.append("Award-offer import follow-up: " + "; ".join(issue["reason"] for issue in award_import_issues))
     cash_quote_issues = report.get("cash_quotes", {}).get("issues", [])
     if cash_quote_issues:
         lines.append("Cash import follow-up: " + "; ".join(issue["reason"] for issue in cash_quote_issues))
@@ -1750,7 +2191,7 @@ def candidate_args(parser: argparse.ArgumentParser, include_search_id: bool = Tr
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="flight",
-        description="Search Seats.aero award availability, cache it in SQLite, and rank options.",
+        description="Research normalized award offers locally, with optional explicitly selected provider adapters.",
     )
     parser.add_argument("--db", type=Path, help="SQLite path (or set FLIGHTS_DB_PATH)")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1785,22 +2226,34 @@ def make_parser() -> argparse.ArgumentParser:
         help="JSON brief or constrained text, for example 'SFO to CDG 2026-09-01 business 2 passengers'",
     )
     research.add_argument("--brief", dest="brief_option", help="explicit alternative to the positional trip brief")
-    research.add_argument("--brief-file", type=Path, help="JSON file containing one structured trip brief")
+    research.add_argument("--brief-file", type=Path, help="JSON brief below imports/ or examples/ (regular file, 1 MB max)")
+    research.add_argument(
+        "--provider", default="manual_import",
+        help="selected award adapter (default: manual_import; run './flight providers --json' for capabilities)",
+    )
     research.add_argument(
         "--fetch", action="store_true",
-        help="explicitly make at most one bounded Seats.aero cached-search request if a fresh exact cache is unavailable",
+        help="explicitly request one bounded fetch only from the selected adapter when it supports authorized fetching",
     )
-    research.add_argument("--cache-ttl-hours", type=float, default=24.0, help="fresh-cache threshold (default: 24)")
-    research.add_argument("--max-results", type=int, default=100, help="fetch cap, 10-100 (default: 100)")
+    research.add_argument("--cache-ttl-hours", type=float, default=24.0, help="fresh-cache threshold for adapters that expose a cache (default: 24)")
+    research.add_argument("--max-results", type=int, default=100, help="provider fetch cap where supported (default: 100; Seats.aero requires 10-100)")
     research.add_argument("--timeout", type=int, default=30)
-    research.add_argument("--limit", type=int, default=5, help="recommendations per program/tax-currency bucket")
+    research.add_argument("--limit", type=int, default=5, help="recommendations per provider/program/tax-currency bucket")
+    research.add_argument(
+        "--award-offer", action="append", default=[],
+        help="normalized manual award-offer JSON object/list; default no-login source, never fetched",
+    )
+    research.add_argument(
+        "--award-offer-file", action="append", default=[], type=Path,
+        help="normalized offer JSON below imports/ or examples/ (regular non-symlink file, 1 MB max)",
+    )
     research.add_argument(
         "--cash-quote", action="append", default=[],
         help="manual cash-quote JSON object/list; never fetched from Google Flights",
     )
     research.add_argument(
         "--cash-quote-file", action="append", default=[], type=Path,
-        help="JSON file containing a manual cash quote object/list",
+        help="cash-quote JSON below imports/ or examples/ (regular file, 1 MB max)",
     )
     research.add_argument(
         "--transfer-profile", action="append", default=[],
@@ -1808,7 +2261,7 @@ def make_parser() -> argparse.ArgumentParser:
     )
     research.add_argument(
         "--transfer-profile-file", action="append", default=[], type=Path,
-        help="JSON file containing one transfer-source profile, a list, or {profiles:[...]}",
+        help="transfer-profile JSON below imports/ or examples/ (regular file, 1 MB max)",
     )
     research_output = research.add_mutually_exclusive_group()
     research_output.add_argument("--json", action="store_true", help="machine-readable research report")
@@ -1830,8 +2283,11 @@ def make_parser() -> argparse.ArgumentParser:
     stats = subparsers.add_parser("stats", help="show local cache and API-call counts")
     stats.add_argument("--json", action="store_true")
 
-    programs = subparsers.add_parser("programs", help="list accepted Seats.aero program source names")
+    programs = subparsers.add_parser("programs", help="list accepted legacy Seats.aero program source names")
     programs.add_argument("--json", action="store_true")
+
+    providers = subparsers.add_parser("providers", help="list local and optional provider capability boundaries")
+    providers.add_argument("--json", action="store_true")
 
     return parser
 
@@ -1841,7 +2297,13 @@ def ensure_positive(args: argparse.Namespace) -> None:
         value = getattr(args, name, None)
         if value is not None and value < 1:
             raise FlightError(f"--{name.replace('_', '-')} must be positive")
-    if getattr(args, "max_results", 10) < 10:
+    selected_provider_id = award_providers.normalize_provider_id(
+        getattr(args, "provider", "manual_import")
+    )
+    seats_minimum_applies = (
+        getattr(args, "command", None) != "research" or selected_provider_id == "seats.aero"
+    )
+    if getattr(args, "max_results", 10) < 10 and seats_minimum_applies:
         raise FlightError("--max-results must be at least 10 (Seats.aero API minimum)")
     cache_ttl_hours = getattr(args, "cache_ttl_hours", 0)
     if cache_ttl_hours is not None and (
@@ -1861,10 +2323,33 @@ def main(argv: list[str] | None = None) -> int:
     parser = make_parser()
     args = parser.parse_args(argv)
     ensure_positive(args)
-    # Keep every pre-existing command's environment behavior intact.  The new
-    # cache-first research command defers loading its local key until it actually needs
-    # an explicit Seats.aero fetch.
-    if args.command != "research":
+    # Provider capability inspection and default manual research are entirely
+    # DB/key-free. The legacy storage adapter is opened only when explicitly selected.
+    if args.command == "providers":
+        manifest = provider_manifest()
+        if args.json:
+            print(json.dumps(manifest, indent=2))
+        else:
+            for item in manifest:
+                credential_note = "credentials required" if item["requires_credentials"] else "no credentials"
+                print(f"{item['id']:<24} {credential_note}; {item['description']}")
+        return 0
+    selected_provider_id = award_providers.normalize_provider_id(
+        getattr(args, "provider", "manual_import")
+    )
+    if args.command == "research" and selected_provider_id != "seats.aero":
+        try:
+            report = run_research(None, args)
+            output_research(report, args)
+            return 0
+        except FlightError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+
+    # Legacy command credentials are only relevant to the two commands that can
+    # contact the optional Seats.aero compatibility API. Cache inspection/init does
+    # not need to load an environment file.
+    if args.command in {"search", "trips"}:
         load_dotenv(PROJECT_DIR / ".env")
     env_db = os.environ.get("FLIGHTS_DB_PATH")
     db_path = (args.db or (Path(env_db).expanduser() if env_db else DEFAULT_DB)).resolve()
